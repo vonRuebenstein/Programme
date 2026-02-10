@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import asyncio
+import websockets
+import socket
+import datetime
+import json
+import argparse
+import ipaddress
+import logging
+import re
+import concurrent.futures
+import sys # Für sys.exit im äussersten Block
+
+# --- Standard-Konfiguration ---
+DEFAULT_UDP_PORTS = [5005, 5006, 5007]
+DEFAULT_UDP_LISTEN_IP = "0.0.0.0"
+DEFAULT_WEBSOCKET_LISTEN_IP = "0.0.0.0"
+
+# --- Logging-Setup ---
+logging.basicConfig(level=logging.INFO,
+                    format='[%(asctime)s] [%(levelname)s]: %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
+
+# Dictionary zur Speicherung von WebSocket-Verbindungen und deren Port-Abonnements
+# Format: {websocket_client_instance: {port1, port2, ...}}
+connected_websockets = {}
+
+# Globale Variablen für Server-Instanzen
+websocket_server = None
+udp_listener_transports = []
+
+# --- NEUE KLASSE FÜR DIE WEBSOCKET-NACHRICHTENVERARBEITUNG ---
+class WebSocketMessageHandler:
+    """Verarbeitet eingehende Nachrichten von einem einzelnen WebSocket-Client."""
+
+    def __init__(self, websocket):
+        self.websocket = websocket
+        self.remote_address = websocket.remote_address
+        self.log = logging.getLogger(__name__)
+
+    async def _subscribe(self, ports):
+        """Fügt Ports zur Abonnement-Liste des Clients hinzu."""
+        if self.websocket not in connected_websockets:
+            connected_websockets[self.websocket] = set()
+        
+        for port in ports:
+            connected_websockets[self.websocket].add(port)
+        
+        self.log.info(f"Client {self.remote_address} abonniert Ports: {ports}")
+
+    async def _unsubscribe(self, ports):
+        """Entfernt Ports aus der Abonnement-Liste des Clients."""
+        if self.websocket in connected_websockets:
+            for port in ports:
+                connected_websockets[self.websocket].discard(port)
+            self.log.info(f"Client {self.remote_address} de-abonniert Ports: {ports}")
+    
+    async def log_connected_clients(self):
+        """Protokolliert die Anzahl der verbundenen Clients und deren Abonnements."""
+        num_clients = len(connected_websockets)
+        self.log.info(f"Aktuell verbundene WebSocket-Clients: {num_clients}")
+        for client, ports in connected_websockets.items():
+            ports_str = ', '.join(map(str, sorted(list(ports))))
+            self.log.info(f" -> Client {client.remote_address} abonniert Ports: {ports_str}")
+
+    async def handle_messages(self, message):
+        """Verarbeitet eingehende Nachrichten vom Client."""
+        try:
+            data = json.loads(message)
+            action = data.get("action")
+            self.log.info(f"Aktion vom Client {self.remote_address} empfangen: {action}")
+
+            # Bestehende Funktionalität für Abonnements
+            if action == "subscribe":
+                ports = data.get("ports", [])
+                await self._subscribe(ports)
+                await self.log_connected_clients()
+            elif action == "unsubscribe":
+                ports = data.get("ports", [])
+                await self._unsubscribe(ports)
+                await self.log_connected_clients()
+            
+            # Neue Funktionalität für Datenanfrage
+            elif action == "request_all_doses":
+                self.log.info("Anfrage zum Abrufen aller Steckdosen-Daten empfangen.")
+                
+                # Befehl unter Verwendung des Python-Interpreters aus der venv
+                command = "/home/pi/venv_Schalten/bin/python /home/pi/Schalten -A spalte"
+                
+                self.log.info(f"Befehl zum Abrufen der Daten wird ausgeführt: {command}")
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+
+                if proc.returncode == 0:
+                    response = {
+                        "action": "getData-response",
+                        "status": "success",
+                        "data": stdout.decode().strip()
+                    }
+                else:
+                    response = {
+                        "action": "getData-response",
+                        "status": "error",
+                        "message": "Fehler beim Abrufen der Steckdosen-Daten.",
+                        "details": stderr.decode().strip()
+                    }
+                
+                await self.websocket.send(json.dumps(response))
+
+            # Neue Funktionalität für Schaltbefehle
+            #elif action == "schalten":
+            #     dose_bezeichnung = data['data']['bezeichnung']
+            #     status = data['data']['status']
+                
+            #     # Befehl unter Verwendung des Python-Interpreters aus der venv
+            #     command = f"/home/pi/venv_Schalten/bin/python /home/pi/Schalten {dose_bezeichnung} {status} -a"
+                
+            #     self.log.info(f"Schaltbefehl wird ausgeführt: {command}")
+            #     proc = await asyncio.create_subprocess_shell(
+            #         command,
+            #         stdout=asyncio.subprocess.PIPE,
+            #         stderr=asyncio.subprocess.PIPE
+            #     )
+            #     stdout, stderr = await proc.communicate()
+                
+            #     response_data = {
+            #         "action": "Schalten-Response",
+            #         "bezeichnung": dose_bezeichnung,
+            #         "status": "success" if proc.returncode == 0 else "error",
+            #         "message": stdout.decode().strip(),
+            #         "details": stderr.decode().strip()
+            #     }
+            #     await self.websocket.send(json.dumps(response_data))
+            #     #await send_to_websockets(response_data, broadcast_all=True)
+            #     await send_to_websockets(dose_array[0], broadcast_all=True)
+
+            # Unerwartete Aktionen
+
+            elif action == "Schalten":
+                self.log.info(f"Schaltbefehl für '{data.get('bezeichnung')}' auf Status {data.get('status')} empfangen.")
+                
+                subprocess_command = f"/home/pi/venv_Schalten/bin/python /home/pi/Schalten {data.get('bezeichnung')} {data.get('status')} -a"
+                
+                proc = await asyncio.create_subprocess_shell(
+                    subprocess_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                stdout, stderr = await proc.communicate()
+                
+                response_to_client = None  # Stellt sicher, dass die Variable immer definiert ist
+                
+                if proc.returncode == 0:
+                    response_data_str = stdout.decode('utf-8')
+                    
+                    try:
+                        json_start_index = response_data_str.find('[')
+                        if json_start_index != -1:
+                            json_string = response_data_str[json_start_index:]
+                            dose_array = json.loads(json_string)
+                            if dose_array and isinstance(dose_array, list) and len(dose_array) > 0:
+                                
+                                # **KORREKTUR**: Sende die Statusdaten als Broadcast an ALLE Clients
+                                await send_to_websockets(dose_array[0], broadcast_all=True)
+                                self.log.info("Schalt-Update als Broadcast an alle Clients gesendet.")
+                            else:
+                                self.log.error(f"Ungültige oder leere JSON-Antwort von Schalten-Skript: {response_data_str}")
+                                response_to_client = {
+                                    "action": "Schalten-Response",
+                                    "status": "error",
+                                    "message": "Serverfehler: Ungültige oder leere JSON-Antwort von Schalten-Skript.",
+                                    "details": response_data_str
+                                }
+                        else:
+                            self.log.error(f"Kein JSON-Array in der Antwort von Schalten-Skript gefunden: {response_data_str}")
+                            response_to_client = {
+                                "action": "Schalten-Response",
+                                "status": "error",
+                                "message": "Serverfehler: Kein JSON-Array in der Skript-Antwort.",
+                                "details": response_data_str
+                            }
+
+                    except json.JSONDecodeError as e:
+                        self.log.error(f"Fehler beim Parsen der JSON-Antwort von Schalten-Skript: {e}. Antwort: {response_data_str}")
+                        response_to_client = {
+                            "action": "Schalten-Response",
+                            "status": "error",
+                            "message": "Serverfehler: Fehler beim Parsen der Skript-Antwort auf dem Server.",
+                            "details": str(e)
+                        }
+
+                else:
+                    response_to_client = {
+                        "action": "Schalten-Response",
+                        "status": "error",
+                        "message": "Fehler beim Ausführen des Schalten-Befehls.",
+                        "details": stderr.decode('utf-8')
+                    }
+
+                # Sende die Fehlermeldung nur an den Client, der sie angefordert hat, wenn ein Fehler aufgetreten ist
+                if response_to_client:
+                    await self.websocket.send(json.dumps(response_to_client))
+
+        except json.JSONDecodeError:
+            self.log.error("Ungültiges JSON von Client empfangen.")
+            await self.websocket.send(json.dumps({"status": "error", "message": "Ungültiges JSON-Format."}))
+        except KeyError as e:
+            self.log.error(f"Fehlende Schlüssel in JSON-Nachricht: {e}")
+            await self.websocket.send(json.dumps({"status": "error", "message": f"Fehlende Daten im JSON: {e}"}))
+        except Exception as e:
+            self.log.error(f"Ein unerwarteter Fehler ist bei der Nachrichtenverarbeitung aufgetreten: {e}", exc_info=True)
+            await self.websocket.send(json.dumps({"status": "error", "message": f"Serverfehler: {e}"}))
+# --- ENDE DER NEUEN KLASSE ---
+
+async def register(websocket, path = "/"):
+    """
+    Registriert einen neuen WebSocket-Client und verarbeitet seine Nachrichten.
+    """
+    handler = WebSocketMessageHandler(websocket)
+    connected_websockets[websocket] = set()
+    handler.log.info(f"Neuer WebSocket-Client verbunden von {websocket.remote_address}. "
+                      f"Aktuell {len(connected_websockets)} Clients.")
+
+    try:
+        # Verarbeite eingehende Nachrichten in einer Schleife
+        async for message in websocket:
+            await handler.handle_messages(message)
+    except websockets.exceptions.ConnectionClosed as e:
+        handler.log.info(f"WebSocket-Verbindung zu {websocket.remote_address} geschlossen: {e.code} - {e.reason}")
+    finally:
+        # Beim Trennen der Verbindung den Client aus der Liste entfernen
+        connected_websockets.pop(websocket, None)
+        handler.log.info(f"WebSocket-Client {websocket.remote_address} getrennt. "
+                          f"Verbleibende Clients: {len(connected_websockets)}.")
+
+async def send_to_websockets(message_data, broadcast_all=False):
+    """
+    Sendet eine Nachricht an alle verbundenen WebSocket-Clients.
+    Wenn broadcast_all=True, wird an alle gesendet, unabhängig vom Port.
+    """
+    if not connected_websockets:
+        return
+    
+    source_port = message_data.get('received_on_port')
+    
+    if source_port is None and not broadcast_all:
+        logging.error(f"Nachricht hat keinen 'received_on_port' Schlüssel und ist kein Broadcast. Kann nicht weitergeleitet werden. Nachricht: {message_data}")
+        return
+
+    try:
+        json_message = json.dumps(message_data)
+    except TypeError as e:
+        logging.error(f"Fehler beim Serialisieren der Nachricht zu JSON: {e}. Nachrichtendaten: {message_data}")
+        return
+
+    disconnected_websockets = set()
+    for websocket, subscribed_ports in list(connected_websockets.items()):
+        if broadcast_all or (source_port in subscribed_ports):
+            try:
+                await websocket.send(json_message)
+            except websockets.exceptions.ConnectionClosed:
+                logging.warning(f"WebSocket Verbindung zu {websocket.remote_address} bereits geschlossen. Entferne aus Liste.")
+                disconnected_websockets.add(websocket)
+            except Exception as e:
+                logging.error(f"Fehler beim Senden an WebSocket {websocket.remote_address}: {e}")
+                disconnected_websockets.add(websocket)
+    
+    for ws in disconnected_websockets:
+        if ws in connected_websockets:
+            del connected_websockets[ws]
+    
+    if disconnected_websockets:
+        logging.info(f"Aktive Verbindungen nach Bereinigung: {len(connected_websockets)}")
+
+# --- UDP Protokoll Handler ---
+class UDPProtocol(asyncio.DatagramProtocol):
+    def __init__(self, port, send_to_ws_callback, websocket_enabled):
+        self.port = port
+        self.send_to_ws_callback = send_to_ws_callback
+        self.websocket_enabled = websocket_enabled
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        sockname = self.transport.get_extra_info('sockname')
+        logging.info(f"UDP Listener auf {sockname[0]}:{sockname[1]} erfolgreich gestartet.")
+
+    def datagram_received(self, data, addr):
+        message = data.decode("utf-8", "ignore").strip()
+        sender_ip, sender_port = addr
+
+        logging.info(f"[FROM PORT:{self.port}] [{sender_ip}:{sender_port}] {message}")
+
+        current_time_iso = datetime.datetime.now().isoformat()
+
+        pulse_match = re.search(r"Impuls erfasst: Zähler-ID (\d+) auf GPIO (\d+) um (\d+\.\d+)", message)
+        log_match = re.search(r"\[(INFO|WARN|ERROR)\]: (.+)", message)
+
+        message_data = None
+
+        if pulse_match:
+            try:
+                counter_id = int(pulse_match.group(1))
+                gpio_pin = int(pulse_match.group(2))
+                raw_timestamp = float(pulse_match.group(3))
+
+                message_data = {
+                    "timestamp": current_time_iso,
+                    "counter_id": counter_id,
+                    "gpio_pin": gpio_pin,
+                    "raw_timestamp": raw_timestamp,
+                    "sender_ip": sender_ip,
+                    "sender_port": sender_port,
+                    "received_on_port": self.port,
+                    "type": "pulse",
+                    "message": message
+                }
+
+            except Exception as e:
+                logging.error(f"Fehler beim Parsen oder Verarbeiten des Impulses: {e}. Originalnachricht: {message}")
+                message_data = {
+                    "timestamp": current_time_iso,
+                    "level": "ERROR",
+                    "message": f"Parsing Fehler (Impuls): {message}",
+                    "sender_ip": sender_ip,
+                    "sender_port": sender_port,
+                    "received_on_port": self.port,
+                    "type": "log"
+                }
+
+        elif log_match:
+            try:
+                log_level = log_match.group(1)
+                log_message = log_match.group(2)
+                message_data = {
+                    "timestamp": current_time_iso,
+                    "level": log_level,
+                    "message": log_message,
+                    "sender_ip": sender_ip,
+                    "sender_port": sender_port,
+                    "received_on_port": self.port,
+                    "type": "log"
+                }
+
+            except Exception as e:
+                logging.error(f"Fehler beim Parsen oder Verarbeiten des Logs: {e}. Originalnachricht: {message}")
+                message_data = {
+                    "timestamp": current_time_iso,
+                    "level": "ERROR",
+                    "message": f"Parsing Fehler (Log): {message}",
+                    "sender_ip": sender_ip,
+                    "sender_port": sender_port,
+                    "received_on_port": self.port,
+                    "type": "log"
+                }
+        else:
+            message_data = {
+                "timestamp": current_time_iso,
+                "level": "UNKNOWN",
+                "message": message,
+                "sender_ip": sender_ip,
+                "sender_port": sender_port,
+                "received_on_port": self.port,
+                "type": "generic"
+            }
+        
+        if self.websocket_enabled and message_data:
+            asyncio.create_task(self.send_to_ws_callback(message_data))
+
+    def error_received(self, exc):
+        logging.error(f"UDP Error auf Port {self.port}: {exc}")
+
+    def connection_lost(self, exc):
+        if exc is not None:
+            logging.warning(f"UDP-Verbindung auf Port {self.port} verloren: {exc}")
+        else:
+            logging.debug(f"UDP-Verbindung auf Port {self.port} sauber geschlossen.")
+
+# --- Argument Parsing ---
+def port_type(port_str):
+    """Validiert, ob ein String eine gültige Portnummer ist."""
+    try:
+        port = int(port_str)
+        if 1 <= port <= 65535:
+            return port
+        raise argparse.ArgumentTypeError(f"Port muss zwischen 1 und 65535 liegen, aber ist {port}.")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Port '{port_str}' ist keine gültige Ganzzahl.")
+
+def ip_address_type(ip_or_hostname_str):
+    """
+    Validiert, ob ein String eine gültige IP-Adresse (IPv4/IPv6) oder ein auflösbarer Hostname ist.
+    Gibt die validierte IP-Adresse oder den ursprünglichen String '0.0.0.0' zurück.
+    """
+    if ip_or_hostname_str == "0.0.0.0":
+        return ip_or_hostname_str
+    
+    try:
+        ipaddress.ip_address(ip_or_hostname_str)
+        return ip_or_hostname_str
+    except ValueError:
+        try:
+            resolved_ip = socket.gethostbyname(ip_or_hostname_str)
+            logging.info(f"Hostname '{ip_or_hostname_str}' aufgelöst zu IP '{resolved_ip}'.")
+            return resolved_ip
+        except socket.gaierror as e:
+            raise argparse.ArgumentTypeError(
+                f"'{ip_or_hostname_str}' ist keine gültige IP-Adresse "
+                f"und konnte nicht als Hostname aufgelöst werden: {e}"
+            )
+        except Exception as e:
+            raise argparse.ArgumentTypeError(
+                f"Unerwarteter Fehler bei der Auflösung von '{ip_or_hostname_str}': {e}"
+            )
+
+def port_list_type(port_strings):
+    """Validiert eine Liste von Portnummern."""
+    ports = []
+    for port_str in port_strings:
+        try:
+            p = int(port_str)
+            if not (0 <= p <= 65535):
+                raise ValueError("Portnummer muss zwischen 0 und 65535 liegen.")
+            ports.append(p)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"Port '{port_str}' ist keine gültige Ganzzahl.")
+    return ports
+
+# --- Graceful Shutdown Funktion ---
+async def shutdown():
+    """Schließt alle Server und bereinigt aktive Tasks für einen sauberen Exit."""
+    logging.info("Starte Graceful Shutdown...")
+
+    # 1. UDP-Listener schließen
+    for transport in udp_listener_transports:
+        if transport:
+            sockname = transport.get_extra_info('sockname')
+            transport.close()
+            logging.info(f"UDP Listener auf {sockname[0]}:{sockname[1]} geschlossen.")
+    
+    # 2. WebSocket-Server schließen
+    if websocket_server:
+        logging.info("Schließe WebSocket Server.")
+        websocket_server.close()
+        logging.info("WebSocket Server geschlossen.")
+
+    # 3. Alle ausstehenden Tasks abbrechen (außer der Shutdown-Task selbst)
+    current_loop = asyncio.get_running_loop()
+    tasks = [task for task in asyncio.all_tasks(loop=current_loop)
+             if task is not asyncio.current_task() and not task.done()]
+    
+    for task in tasks:
+        task.cancel() # Sende Abbruchsignal an die Tasks
+    
+    logging.info(f"Warte auf den Abschluss von {len(tasks)} asynchronen Tasks...")
+    
+    if tasks: # Nur warten, wenn es Tasks gibt
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logging.info("Alle asynchronen Tasks beendet.")
+
+    logging.info("Server wurde erfolgreich heruntergefahren.")
+
+async def main():
+    """Hauptfunktion des Servers, die Argumente parst und Listener startet."""
+    global websocket_server, udp_listener_transports
+    
+    parser = argparse.ArgumentParser(
+        description="""
+        Server zum Empfangen von UDP-Nachrichten und optionaler Weiterleitung an WebSockets.
+        Verarbeitet Impulse und Log-Nachrichten.
+        """,
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        '--udp-ip',
+        type=ip_address_type,
+        default=DEFAULT_UDP_LISTEN_IP,
+        help=f"IP-Adresse oder Hostname für den UDP-Listener.\n"
+             f"Verwenden Sie '0.0.0.0' um auf allen verfügbaren Schnittstellen zu lauschen.\n"
+             f"Standard: {DEFAULT_UDP_LISTEN_IP}"
+    )
+    parser.add_argument(
+        '--websocket-ip',
+        type=ip_address_type,
+        default=DEFAULT_WEBSOCKET_LISTEN_IP,
+        help=f"IP-Adresse oder Hostname für den WebSocket-Server.\n"
+             f"Verwenden Sie '0.0.0.0' um auf allen verfügbaren Schnittstellen zu lauschen.\n"
+             f"Standard: {DEFAULT_WEBSOCKET_LISTEN_IP}"
+    )
+    parser.add_argument(
+        '-u', '--udp-ports',
+        type=str,
+        nargs='+',
+        default=[str(p) for p in DEFAULT_UDP_PORTS],
+        help=f"Eine Liste von UDP-Ports, auf denen der Server lauschen soll, getrennt durch Leerzeichen.\n"
+             f"Beispiel: -u 5005 5006 5007\n"
+             f"Standard: {' '.join([str(p) for p in DEFAULT_UDP_PORTS])}"
+    )
+    parser.add_argument(
+        '-w', '--websocket-port',
+        type=port_type,
+        default=None,
+        help=f"Der Port für den WebSocket-Server.\n"
+             f"Wenn dieser Parameter nicht angegeben wird, \n"
+             f"startet der WebSocket-Server nicht.\n"
+             f"Beispiel: -w 8765"
+    )
+    parser.add_argument(
+        '-q', '--quiet',
+        action='store_true',
+        help="Schaltet INFO-Meldungen auf der Konsole ab. Nur WARNING, ERROR und CRITICAL werden angezeigt."
+    )
+
+    args = parser.parse_args()
+
+    # --- Loglevel anpassen basierend auf dem 'quiet'-Argument ---
+    if args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+        logging.warning("INFO-Meldungen auf der Konsole sind abgeschaltet (--quiet).")
+    else:
+        logging.info("INFO-Meldungen auf der Konsole sind aktiv.")
+
+    udp_listen_ip = args.udp_ip
+    websocket_listen_ip = args.websocket_ip
+    udp_ports_to_listen = port_list_type(args.udp_ports)
+    websocket_port = args.websocket_port
+    
+    websocket_enabled = (websocket_port is not None)
+    
+    if not udp_ports_to_listen:
+        logging.critical("Keine gültigen UDP-Ports zum Lauschen konfiguriert. Beende Server.")
+        return
+
+    try:
+        if websocket_enabled:
+            websocket_server = await websockets.serve(
+                register,
+                websocket_listen_ip,
+                websocket_port
+            )
+            logging.info(f"Starte WebSocket Server auf {websocket_listen_ip}:{websocket_port}...")
+        else:
+            logging.info("WebSocket Server ist nicht aktiviert (kein --websocket-port angegeben).")
+        
+        # --- UDP Listener starten ---
+        current_loop = asyncio.get_running_loop()
+        logging.info(f"Versuche, UDP Listener auf {udp_listen_ip} auf folgenden Ports zu starten: {udp_ports_to_listen}")
+        for port in udp_ports_to_listen:
+            try:
+                transport, protocol = await current_loop.create_datagram_endpoint(
+                    lambda: UDPProtocol(port, send_to_websockets, websocket_enabled),
+                    local_addr=(udp_listen_ip, port)
+                )
+                udp_listener_transports.append(transport)
+            except OSError as e:
+                logging.error(f"FEHLER: Konnte UDP Listener auf {udp_listen_ip}:{port} nicht starten: {e}")
+                if e.errno == 99:
+                    logging.error(" -> Überprüfen Sie, ob die angegebene IP-Adresse auf diesem System existiert oder '0.0.0.0' verwendet wird.")
+                elif e.errno == 98:
+                    logging.error(" -> Der Port ist bereits belegt.")
+            except Exception as e:
+                logging.error(f"Unerwarteter Fehler beim Starten des UDP Listener auf {udp_listen_ip}:{port}: {e}")
+
+        if not udp_listener_transports:
+            logging.critical("Keine UDP-Listener konnten erfolgreich gestartet werden. Server wird beendet.")
+            return
+
+        logging.info(f"Warte auf eingehende Nachrichten...")
+        logging.info(f"Server läuft. Drücken Sie Strg+C (interaktiv) oder senden Sie SIGTERM (Daemon) zum Beenden.")
+
+        while True:
+            await asyncio.sleep(3600)
+
+    except asyncio.CancelledError:
+        logging.info("Haupt-Coroutine wurde abgebrochen (CancelledError). Initiere sauberen Shutdown.")
+        await shutdown()
+    except OSError as e:
+        logging.critical(f"FEHLER: Konnte Server nicht starten (Bind-Fehler bei WebSocket oder UDP): {e}")
+        if e.errno == 99:
+            logging.error(" -> Überprüfen Sie die angegebene IP-Adresse.")
+        elif e.errno == 98:
+            logging.error(" -> Ein Port ist bereits belegt.")
+        logging.critical("Serverstart fehlgeschlagen. Beende.")
+        return
+    except Exception as e:
+        logging.critical(f"Ein unerwarteter Fehler ist im Hauptprogramm aufgetreten: {e}", exc_info=True)
+        return
+    finally:
+        logging.info("Main-Funktion wird beendet.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logging.info("Manuell beendet durch Benutzer (Strg+C). Shutdown-Prozess sollte laufen/gelaufen sein.")
+    except SystemExit:
+        logging.info("Server-Prozess durch SystemExit beendet.")
+    except Exception as e:
+        logging.critical(f"Ein unerwarteter Fehler ist im 'if __name__ == \"__main__\"'-Block aufgetreten: {e}", exc_info=True)

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+    
+<head lang="de-DE">
+    <meta charset="UTF-8">
+    <meta name="author" content="Maria Roscher">
+    <meta name="date" content="29.12.2023 16:30">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex">
+    <meta name="description" content="dient zum Schalten von Funksteckdosen im privatem Netzwerk">   
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.2/dist/full.min.css" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Schalte Funksteckdosen 433MHz und Zigbee</title>
+</head>
+
+<body class="bg-base-200">
+    <header>
+        <nav class="navbar bg-base-100">
+            <div class="navbar-start">
+                <div class="dropdown">
+                    <div tabindex="0" role="button" class="btn btn-ghost lg:hidden">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h8m-8 6h16" /></svg>
+                    </div>
+                    <ul tabindex="0" class="menu menu-sm dropdown-content mt-3 z-[1] p-2 shadow bg-base-100 rounded-box w-52">
+                        <li><a href="http://pipbh.b5.intern/SmartHome.html" class="active">Bungalow</a></li>
+                        <li><a href="http://pizuhause.roscher.intern/SmartHome.html">zu Hause</a></li>
+                        <li class="dropdown-end dropdown">
+                            <a tabindex="0">Diagnose</a>
+                            <ul class="dropdown-menu p-2 shadow-md bg-base-100 rounded-box w-52">
+                                <li><a href="Diagnose.html">Zählen Daemon</a></li>
+                                <li><a href="#">Weiteres folgt hier</a></li>
+                            </ul>
+                        </li>
+                    </ul>
+                </div>
+                <a class="btn btn-ghost text-xl">Bungalow B5</a>
+            </div>
+            <div class="navbar-center hidden lg:flex">
+                <ul class="menu menu-horizontal px-1">
+                    <li class="dropdown-end dropdown">
+                        <a tabindex="0" class="active">Smarthome Steuerung</a>
+                        <ul class="dropdown-menu p-2 shadow-md bg-base-100 rounded-box w-52">
+                            <li><a href="http://pipbh.b5.intern/SmartHome.html">Bungalow</a></li>
+                            <li><a href="http://pizuhause.roscher.intern/SmartHome.html">zu Hause</a></li>
+                        </ul>
+                    </li>
+                    <li class="dropdown-end dropdown">
+                        <a tabindex="0">Diagnose</a>
+                        <ul class="dropdown-menu p-2 shadow-md bg-base-100 rounded-box w-52">
+                            <li><a href="Diagnose.html">Zählen Daemon</a></li>
+                            <li><a href="#">Weiteres folgt hier</a></li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+            <div class="navbar-end">
+                <a class="btn btn-ghost">Home</a>
+            </div>
+        </nav>
+        <h1 class="text-4xl font-bold text-center mt-8">Funksteckdosen</h1>
+    </header>
+
+    <main class="container mx-auto px-4 mt-8">
+        <div id="steckdosen" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4"></div>
+    </main>
+    <div id="benachrichtigungsContainer" class="toast toast-end z-[100]"></div>
+
+    <script src="scripts/js/Smarthome.js"></script>
+</body>
+</html>

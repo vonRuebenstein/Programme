@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+#Aufruf
+#./Advent Steckdosenbezeichnung		prüft ob aktuelles Datum >= Totensnntag +1 Tag ist und schaltet <Steckdosenbezeichnung> ein
+#./Advent -J 						berechnet Totensonntag sowie 1. bis 4. Advent für das aktuelle Jahr
+#./Advent -J <Jahr>					berechnet Totensonntag sowie 1. bis 4. Advent für das angegebene Jahr
+
+import datetime
+import sys
+import subprocess
+import argparse
+
+def Schalten(Dose):
+	#Schaltfunktionn steuern
+	
+	#Schalten überspringen wenn None der "" in DB zurückgeliefert
+	#Gruppencode für keine Schaltvorgänge in Steuerdatei
+	Programm='/home/pi/Schalten'	#Programm zum schalten von Funksteckdosen
+
+	sliste=[]
+	sliste.append(Programm)
+	sliste.append(Dose)
+	sliste.append('1')		
+			
+	try:
+		s=subprocess.Popen(sliste)
+	except FileNotFoundError as err:
+		print(datetime.time.strftime("%d.%m.%Y %H:%M:%S"),"Programm "+sliste[0]+" nicht gefunden",file=sys.stderr)
+	else:
+		s.wait()
+	#Schaltfunktionen steuern Ende
+	return()
+
+if __name__ == "__main__":
+	now=datetime.date.today()
+	jahr=now.year 
+
+	parser=argparse.ArgumentParser (description="""Berechnet das Datum vom Totensonntag, sowie der vier Adventssonntage.\n
+									oder schaltet die angegeben Funksteckdose 1 Tag nach Totensonntag ein""", 
+									epilog="MR2022")
+	
+	subparser = parser.add_subparsers(dest="command")
+
+	calculate_parser=subparser.add_parser("calc", help="Berechnet Totensonntag und die 4 Advente")
+	calculate_parser.add_argument("-J","--Jahr",default=jahr,help="Jahr, welches für die Berechnung gelten soll", type=int)
+	
+	switch_parser=subparser.add_parser("switch", help="Schaltet angegebene Funksteckdose frühestens 1 Tag nach Totensonntag")
+	switch_parser.add_argument("Schalten", help="Bezeichnung einer für Schaltzwecke dienenden Funkschaltsteckdose",nargs="?", type=str)
+	switch_parser.add_argument("-O", "--Offset", default=1,choices=range(1,8),help="Schaltoffset in Tagen", type=int)
+	#group = parser.add_mutually_exclusive_group()
+	#group.add_argument("-J","--Jahr",default=jahr,help="Jahr, welches für die Berechnung gelten soll", type=int)
+	#group.add_argument("Schalten", help="Bezeichnung einer für Schaltzwecke dienenden Funkschaltsteckdose",nargs="?", type=str)#choices=Dl,type=str)
+	
+	args=parser.parse_args()
+	#print (args)
+	
+	try:
+		Jahr=args.Jahr
+	except AttributeError as err:
+		Jahr=jahr
+	finally:
+
+		try:
+			weihnachten=datetime.date(Jahr,12,25)
+		except ValueError as err:
+			print ("Die Jahreszahl für das zu berechnende Jahr muss zwichen 0 und 9999 liegen.")
+			print ("Die Jahreszahl wird auf das aktuelle Jahr gesetzt.")
+			weihnachten=datetime.date(jahr,12,25)
+		finally:
+			wochentag=weihnachten.weekday()
+		
+	vierter_advent = weihnachten - datetime.timedelta(wochentag + 1)
+	dritter_advent = weihnachten - datetime.timedelta(wochentag + 8)
+	zweiter_advent = weihnachten - datetime.timedelta(wochentag + 15)
+	erster_advent = weihnachten - datetime.timedelta(wochentag + 22)
+	totensonntag = weihnachten - datetime.timedelta(wochentag + 29)
+	
+	if args.command =="calc":
+		# #Ausgabe der Uebersicht auf dem Bildschirm
+		print (totensonntag.strftime('Totensonntag am %d.%m.%Y'))
+		print (erster_advent.strftime('1. Advent am %d.%m.%Y'))
+		print (zweiter_advent.strftime('2. Advent am %d.%m.%Y'))
+		print (dritter_advent.strftime('3. Advent am %d.%m.%Y'))
+		print (vierter_advent.strftime('4. Advent am %d.%m.%Y'))
+		
+	elif args.command == "switch":
+		Datum_Schalten=totensonntag + datetime.timedelta(days=args.Offset)
+		print ("Schaltvorgang erfolgt ab dem ",Datum_Schalten.strftime('%d.%m.%Y'))
+		if now>= Datum_Schalten and now <=datetime.date(jahr, 12, 31):
+			Schalten (args.Schalten)
+	else:
+		print("Sie müsse mier schie soange wasch mache soll.")
+
+sys.exit(0)

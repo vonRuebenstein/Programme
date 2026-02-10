@@ -1,0 +1,328 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+"""
+#Aufruf
+#./Zaehlerstand.py
+#./Zaehlerstand.py |[Zeahlerkurzbezeichnung]|[list]
+#Fehlt Zaehlerkurzbezeichnung erfolgt Ausgabe Zaehlerstand auf STDOUT
+#Zaehlerkurzbezeichnung setzt neuen Zaehlerstand oder initialisiert
+#neuen Zähler
+#list Listet alle in der Datenbank gespeicherten Zähler mit allen Eigenschften auf
+"""
+
+import os
+import sys
+import time
+import mysql.connector # mysql ist nicht direkt notwendig, nur mysql.connector
+import toml # Neu hinzugefügt für TOML-Parsing
+from colorama import init,Fore,Back,Style
+init(autoreset=True)
+
+# --- Globale Konfiguration ---
+# Pfad zur Haupt-Konfigurationsdatei (TOML)
+# Stellen Sie sicher, dass dieser Pfad korrekt ist und mit dem des Daemons übereinstimmt.
+CREDENTIALS_FILE_PATH = "/home/pi/.credentials.toml"
+
+# --- Saison-Einstellungen (bleiben wie sie sind) ---
+SaisonAnfang='01.04.'   #Saisonanfang Tag.Monat.
+SaisonEnde='30.09.'     #Saisonende Tag.Monat.
+EntnahmeNullUZWHS=0.01  #Entnahmemenge in l/min kleiner als nebenan wird nicht angezeigt Saisonbetrieb
+EntnahmeNullUZWNS=0.01  #Entnahmemenge in l/min kleiner als nebenan wird nicht angezeigt Nebensaisonbetrieb
+EntnahmeNullUZSHS=1     #Entnahmeleistung in Watt kleiner als nebenan wird nicht angezeigt Saisonbetrieb
+EntnahmeNullUZSNS=1     #Entnahmeleistung in Watt kleiner als nebenan wird nicht angezeigt Nebensaisonbetrieb 
+
+DatumHSAnfang=time.strptime(SaisonAnfang+time.strftime('%Y'),'%d.%m.%Y')
+DatumHSEnde=time.strptime(SaisonEnde+time.strftime('%Y'),'%d.%m.%Y')
+if DatumHSAnfang<=time.localtime() and time.localtime()<=DatumHSEnde:
+    Saison='Hauptsaison'
+else:
+    Saison='Nebensaison'
+
+# --- Funktion zum Laden der Konfigurationsdatei (angepasst für TOML) ---
+def load_config_from_toml(file_path: str) -> dict:
+    """Lädt Konfigurationsdaten aus einer TOML-Datei."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {file_path}")
+    
+    try:
+        with open(file_path, 'r') as f:
+            data = toml.load(f)
+            if not isinstance(data, dict):
+                raise ValueError(f"Ungültige Konfiguration: {file_path} enthält kein Wörterbuch.")
+            
+            # Prüfen, ob die 'zaehlen'-Sektion und alle benötigten Schlüssel vorhanden sind
+            # Die Schlüssel sind hier 'db_host', 'db_user', 'db_pwd', 'db_name' wie in der .toml definiert
+            required_keys = ["db_host", "db_user", "db_pwd", "db_name"]
+            if "zaehlen" not in data or not all(key in data["zaehlen"] for key in required_keys):
+                raise ValueError(f"Fehlende erforderliche Schlüssel in der 'zaehlen'-Sektion von {file_path}.")
+            
+            return data["zaehlen"]
+    except toml.TomlDecodeError as e:
+        raise ValueError(f"Fehler beim Decodieren von TOML aus {file_path}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Unerwarteter Fehler beim Lesen von {file_path}: {e}")
+
+# --- Laden der Anmeldeinformationen beim Start des Skripts ---
+try:
+    config = load_config_from_toml(CREDENTIALS_FILE_PATH)
+    DBHost = config["db_host"]
+    DBUser = config["db_user"]
+    DBPwd = config["db_pwd"]
+    DB = config["db_name"]
+except (FileNotFoundError, ValueError, RuntimeError) as e:
+    print(f"Fehler beim Laden der Datenbank-Anmeldeinformationen: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# --- Formatierungs- und Input-Funktionen (unverändert) ---
+def FormatAusgabe (Datei,Zeit,Stand,Zeitdiff,Entnahme,Einheit):
+    Ausgabe=f"{time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(int(Zeit)))} {Datei} {Stand:09.3f}   {Zeitdiff:11.2f}s {Entnahme:8.2f}"
+    Ausgabe=Ausgabe+Einheit
+    return(Ausgabe)
+
+def InputNumeric(Prompt,Stringerlaubt):
+    while True:
+        i=input(Prompt)
+        if i==Stringerlaubt:
+            break
+        try:
+            i=float(i)
+        except ValueError as err:
+            continue
+        else:
+            i=abs(i)
+            break
+    return(i)
+
+# --- Start Hauptprogramm (Datenbankverbindung und Logik) ---
+try:
+    db = mysql.connector.connect(host=DBHost,
+                                    user=DBUser,
+                                    passwd=DBPwd,
+                                    db=DB)
+                                            
+except mysql.connector.InterfaceError as err:
+    print(time.strftime("%d.%m.%Y %H:%M:%S"),"MySQL DB Server auf",DBHost,"nicht erreichbar",file=sys.stderr)
+    sys.exit(1)
+    
+except mysql.connector.DatabaseError as err:                                         
+    print(time.strftime("%d.%m.%Y %H:%M:%S"),"MySQL DB Error",file=sys.stderr)
+    sys.exit(1)
+
+else:
+    
+    #Zählerstände und aktuelle Entnahmewerte aus Datenbank auslesen
+    if len(sys.argv)==1:
+        
+        print(Fore.BLUE+Style.BRIGHT+time.strftime("%d.%m.%Y %H:%M:%S")+" "+Saison)
+        print('Datum      Zeit     Zähler  Stand Zeitdifferenz      Entnahme')
+        print('-------------------------------------------------------------')
+            
+        cursoraktiv=db.cursor()
+        cursoraktiv.execute ("""SELECT 
+                                    Bungalow.Zaehler.Kurzname,
+                                    (CASE 
+                                        WHEN Bungalow.Zaehler.Einheit ='l/min' THEN COUNT(*)*1/Bungalow.Zaehler.TicksproEinheit+Bungalow.Zaehler.InitWert
+                                        WHEN Bungalow.Zaehler.Einheit='W' THEN COUNT(*)*1/Bungalow.Zaehler.TicksproEinheit+Bungalow.Zaehler.InitWert
+                                    END) AS Zaehlerstand
+                                    FROM
+                                        Bungalow.Zaehlerwerte
+                                            LEFT JOIN
+                                        Bungalow.Zaehler ON Bungalow.Zaehler.ID = Bungalow.Zaehlerwerte.Zaehler_ID
+                                    WHERE
+                                        Bungalow.Zaehlerwerte.Zeitstempel >= Bungalow.Zaehler.InitTimestamp 
+                                    GROUP BY
+                                        Bungalow.Zaehler.Kurzname""")
+        zaehleraktiv=cursoraktiv.fetchall()
+        
+        for zaehler in zaehleraktiv:
+            
+            try:
+
+                cursorwerte=db.cursor()
+                cursorwerte.execute(""" WITH d AS(
+                                        SELECT
+                                            Bungalow.Zaehlerwerte.ID,
+                                            Bungalow.Zaehler.Kurzname,
+                                            Bungalow.Zaehler.Einheit,
+                                            Bungalow.Zaehlerwerte.Zeitstempel,
+                                            Bungalow.Zaehlerwerte.Zeitstempel - LAG(Bungalow.Zaehlerwerte.Zeitstempel) OVER w AS 'Differenz',
+                                            Bungalow.Zaehler.TicksproEinheit,
+                                            Bungalow.Zaehler.NullEntnahmeSaison,
+                                            Bungalow.Zaehler.NullEntnahmeNebenSaison
+                                        FROM
+                                            Bungalow.Zaehlerwerte
+                                                LEFT JOIN
+                                            Bungalow.Zaehler ON Bungalow.Zaehler.ID = Bungalow.Zaehlerwerte.Zaehler_ID
+                                        WHERE 
+                                            Bungalow.Zaehler.Kurzname = %s
+                                                AND
+                                            Bungalow.Zaehlerwerte.Zeitstempel >= Bungalow.Zaehler.InitTimestamp 
+                                        WINDOW w AS (PARTITION BY Bungalow.Zaehler.Kurzname ORDER BY Bungalow.Zaehlerwerte.Zeitstempel ROWS UNBOUNDED PRECEDING))
+                                        -- 
+                                        SELECT
+                                            d.ID,
+                                            d.Kurzname,
+                                            d.Zeitstempel AS Zeit,
+                                            d.Differenz,
+                                            (CASE
+                                                WHEN d.Einheit ='l/min' THEN ROUND(60/d.Differenz*1000/d.TicksproEinheit,2) 
+                                                WHEN d.Einheit ='W' THEN ROUND(3600/d.Differenz*1000/d.TicksproEinheit,2)
+                                            END) AS Entnahme,
+                                            d.Einheit,
+                                            d.NullEntnahmeSaison,
+                                            d.NullEntnahmeNebenSaison
+                                        FROM
+                                            d
+                                        ORDER BY Zeit DESC
+                                        LIMIT 0,1""" %("'"+zaehler[0]+"'"))
+
+                werte=cursorwerte.fetchone()
+                Zeitdiff=werte[3]
+                Entnahme=werte[4]
+
+            except TypeError as err:
+                continue
+                
+            if Saison=='Hauptsaison':
+                if werte[5]=='W':
+                    if 3600/werte[6]<time.time()-float(werte[2]):
+                        Entnahme=0
+                        Zeitdiff=time.time()-float(werte[2])
+                elif werte[5]=='l/min':
+                    if 60/werte[6]<time.time()-float(werte[2]):                 
+                        Entnahme=0
+                        Zeitdiff=time.time()-float(werte[2])
+            elif Saison=='Nebensaison':
+                if werte[5]=='W':
+                    if 3600/werte[7]<time.time()-float(werte[2]):
+                        Entnahme=0
+                        Zeitdiff=time.time()-float(werte[2])
+                elif werte[5]=='l/min':
+                    if 60/werte[7]<time.time()-float(werte[2]):                 
+                        Entnahme=0
+                        Zeitdiff=time.time()-float(werte[2])
+                    
+            Ausgabe=FormatAusgabe(zaehler[0],werte[2],zaehler[1],Zeitdiff,Entnahme,werte[5])
+            print (Ausgabe)
+
+            cursorwerte.close()
+        cursoraktiv.close()
+    
+    
+    elif len(sys.argv)==2:
+        
+        if sys.argv[1]=="list":
+            print(Fore.BLUE+Style.BRIGHT+"Zählerliste erstellen") 
+            cursorliste=db.cursor()
+            cursorliste.execute("""SELECT
+                                        Bungalow.Zaehler.Bezeichnung,
+                                        Bungalow.Zaehler.Kurzname
+                                    FROM
+                                        Bungalow.Zaehler""") # Korrektur: Bungaglow zu Bungalow
+            zaehler=cursorliste.fetchall()
+            for i in zaehler:
+                print (i)
+            cursorliste.close()
+            
+        else:
+            #Prüfe ob Zaehler Kurzname vorhanden
+            cursorzaehlerok=db.cursor()
+            cursorzaehlerok.execute ("""SELECT
+                                            ID,
+                                            Bungalow.Zaehler.Kurzname,
+                                            Bungalow.Zaehler.Bezeichnung
+                                        FROM
+                                            Bungalow.Zaehler
+                                        WHERE
+                                            Bungalow.Zaehler.Kurzname = %s""" %("'"+sys.argv[1]+"'"))
+            zaehlerok=cursorzaehlerok.fetchone()
+            
+            if zaehlerok is None:
+                #Zaehler Kurzname nicht vorhanden
+                cursorzaehler=db.cursor()
+                cursorzaehler.execute("""SELECT
+                                            Bungalow.Zaehler.Kurzname
+                                        FROM
+                                            Bungalow.Zaehler
+                                        ORDER BY
+                                            Bungalow.Zaehler.Kurzname""" )
+                zaehler=cursorzaehler.fetchall()
+                print("Kurzbezeichnung muß "+str(zaehler)+" lauten")
+                cursorzaehler.close()
+    
+            else:
+                #Kurzname vorhanden
+                if zaehlerok[2]==None:
+                    #Zahler unbenutzt neu initialisieren
+                    print (Fore.BLUE+Style.BRIGHT+'Zähler mit Standardwerten neu einrichten')
+                    neubezeichnung=input('Geben Sie eine Bezeichnung für den Zähler ein. max. 45 Zeichen ')
+                    neuwert=InputNumeric('Geben Sie eine Zählerstand für den neuen Zähler ein: ',None)
+                    neuwert=str(neuwert)
+                    zeit=str(time.time())
+                    cursorupdate=db.cursor()
+                    cursorupdate.execute("""UPDATE
+                                                Bungalow.Zaehler
+                                            SET
+                                                Bungalow.Zaehler.Bezeichnung = %s,
+                                                Bungalow.Zaehler.InitTimestamp = %s,
+                                                Bungalow.Zaehler.InitWert = %s
+                                            WHERE
+                                                Bungalow.Zaehler.ID = %s""" %("'"+neubezeichnung+"'",zeit,neuwert,zaehlerok[0])) # Korrektur: InitTimestap zu InitTimestamp
+                                                
+                    aktion='Möchten Sie '+neubezeichnung+' auf Stand '+neuwert+' setzen?'
+                    print(Fore.YELLOW+Style.BRIGHT+'Sie müssen mit "sudo service ZaehlenD restart" den Zähler Daemon neustarten.')
+                    cursorupdate.close()
+            
+                else:
+                    #Zaehler benutzt, neu setzten oder deaktivieren
+                    neuwert=InputNumeric('Geben Sie einen neuen Zählerstand ein. "Löschen" deaktiviert Zähler ','Löschen')
+                    if neuwert=="Löschen":
+                        print (Fore.BLUE+Style.BRIGHT+'Zähler deaktivieren, Zählerdaten werden nicht gelöscht')
+                        cursorupdate=db.cursor()
+                        cursorupdate.execute("""UPDATE
+                                                    Bungalow.Zaehler
+                                                SET
+                                                    Bungalow.Zaehler.Bezeichnung = NULL,
+                                                    Bungalow.Zaehler.InitTimestamp = NULL,
+                                                    Bungalow.Zaehler.InitWert = NULL
+                                                WHERE
+                                                    Bungalow.Zaehler.ID = %s""" %(zaehlerok[0])) # Korrektur: InitTimestap zu InitTimestamp
+                        
+                        aktion="Möchten Sie "+zaehlerok[2]+" deaktivieren?"
+                        print(Fore.YELLOW+Style.BRIGHT+'Sie müssen mit "sudo service ZaehlenD restart" den Zähler Daemon neustarten')
+                        cursorupdate.close()
+            
+                    else:
+                        print (Fore.BLUE+Style.BRIGHT+"Stand setzen")
+                        cursorupdate=db.cursor()
+                        zeit=str(time.time())
+                        neuwert=str(neuwert)
+                        cursorupdate.execute("""UPDATE
+                                                    Bungalow.Zaehler
+                                                SET
+                                                    Bungalow.Zaehler.InitTimestamp = %s,
+                                                    Bungalow.Zaehler.InitWert = %s
+                                                WHERE
+                                                    Bungalow.Zaehler.ID = %s""" %(zeit,neuwert,zaehlerok[0])) # Korrektur: InitTimestap zu InitTimestamp
+                                                        
+                        aktion="Möchten Sie "+zaehlerok[2]+" auf Stand "+neuwert+" setzen?"
+                        cursorupdate.close()
+                
+                print(Fore.MAGENTA+Style.BRIGHT+aktion)
+                ok=input('Bestätigen Sie die Aktion mit "ja". Alles andere bricht ab ')
+                if ok=="ja":
+                    db.commit()
+                    print(Fore.GREEN+Style.BRIGHT+'Aktion erfolgreich durchgeführt')
+            
+                else:
+                    db.rollback()
+                    print(Fore.RED+Style.BRIGHT+'Aktion abgebrochen')
+            
+            cursorzaehlerok.close() 
+    
+    else:
+        print('Mit suuuuuuu vieeeelen Argumenten komsch net kloar')
+
+db.close()
+sys.exit(0)

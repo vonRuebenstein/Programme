@@ -1,0 +1,302 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import logging
+import asyncio
+import subprocess
+import argparse
+import toml
+import time
+import json
+import mysql.connector
+import sys
+import csv
+import os
+
+# Importe für rich
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+# Einstellungen
+Eingabe_Index=1                         # Position Bungalowbezeichnung in sys.argv
+Ausgabe_Index=2                         # Position Ausgabedatein in sys.argv
+
+w1_Pfad = '/sys/bus/w1/devices/w1_bus_master1/'
+w1_Sensor = '/w1_slave'                 # Sensor Datei
+
+CRC_Pos = 36                            # Position CRC in W1 Datei
+Temp_Pos = 29                           # Position Temperatur in W1 Datei
+# Einstellungen Ende
+
+# NEUE KLASSEN UND FUNKTIONEN AUS DEM VORSCHLAG
+
+class DatabaseManager:
+    """
+    Verwaltet die Datenbankverbindung und -operationen robuster.
+    Implementiert Wiederverbindungsversuche und Kontext-Manager-Protokoll.
+    """
+    RETRY_ATTEMPTS = 5      # Maximale Anzahl der Wiederholungsversuche bei Verbindungsfehlern
+    RETRY_DELAY_BASE = 2    # Basis-Verzögerung in Sekunden für Exponential Backoff
+
+    def __init__(self, db_host, db_name, db_user, db_pwd):
+        self.__db_host = db_host
+        self.__db_name = db_name
+        self.__db_user = db_user
+        self.__db_pwd = db_pwd
+        self.__connection = None
+        self.__is_connected = False
+        self._connect()
+
+    def _connect(self):
+        """
+        Versucht, eine Verbindung zur MySQL-Datenbank aufzubauen.
+        Implementiert Exponential Backoff für Wiederholungsversuche.
+        """
+        for attempt in range(self.RETRY_ATTEMPTS):
+            try:
+                self.__connection = mysql.connector.connect(
+                    host=self.__db_host,
+                    database=self.__db_name,
+                    user=self.__db_user,
+                    password=self.__db_pwd,
+                    autocommit=False # Manuelles Transaktionsmanagement
+                )
+                if self.__connection.is_connected():
+                    logging.info("Erfolgreich mit der Datenbank verbunden.")
+                    self.__is_connected = True
+                    return True
+            except mysql.connector.Error as err:
+                logging.warning(f"Verbindungsversuch {attempt + 1}/{self.RETRY_ATTEMPTS} zur Datenbank {self.__db_host}/{self.__db_name} fehlgeschlagen: {err}")
+                if attempt < self.RETRY_ATTEMPTS - 1:
+                    # Exponential Backoff
+                    delay = self.RETRY_DELAY_BASE * (2 ** attempt)
+                    logging.info(f"Warte {delay} Sekunden vor dem nächsten Verbindungsversuch...")
+                    time.sleep(delay)
+                else:
+                    logging.critical(f"Alle {self.RETRY_ATTEMPTS} Verbindungsversuche fehlgeschlagen. Programm wird beendet.")
+                    sys.exit(1) # Beende das Programm, wenn keine Verbindung möglich ist
+        self.__is_connected = False
+        return False
+
+    def is_connected(self):
+        """Überprüft, ob die Datenbankverbindung aktiv ist."""
+        return self.__is_connected and self.__connection and self.__connection.is_connected()
+
+    def execute_query(self, query: str, params=None, fetch_results=True):
+        """
+        Führt eine SQL-Abfrage aus und gibt die Ergebnisse zurück (falls zutreffend).
+        Umfasst Fehlerbehandlung und Transaktionsmanagement.
+        """
+        if not self.is_connected():
+            logging.info("Datenbankverbindung nicht aktiv oder verloren. Versuche Neuverbindung...")
+            if not self._connect(): # Versuche, die Verbindung wiederherzustellen
+                return None # Neuverbindung fehlgeschlagen
+
+        cursor = None
+        try:
+            cursor = self.__connection.cursor()
+            cursor.execute(query, params)
+
+            if query.strip().upper().startswith("SELECT") and fetch_results:
+                columns = [col[0] for col in cursor.description]
+                results = cursor.fetchall()
+                # Rückgabe einer Liste von Dictionaries statt einer Liste von Tupeln
+                data = [dict(zip(columns, row)) for row in results]
+                return data
+            else:
+                self.__connection.commit() # Änderungen festschreiben
+                return True
+        except mysql.connector.Error as err:
+            logging.error(f"Datenbankfehler bei Ausführung von Query: '{query}' - {err}")
+            if self.__connection:
+                self.__connection.rollback() # Änderungen rückgängig machen bei Fehler
+            return False
+        except Exception as e:
+            logging.error(f"Ein unerwarteter Fehler ist aufgetreten: {e}", exc_info=True)
+            if self.__connection:
+                self.__connection.rollback()
+            return False
+        finally:
+            if cursor:
+                cursor.close()
+
+    def close(self):
+        """Schließt die Datenbankverbindung, falls sie aktiv ist."""
+        if self.__connection and self.__connection.is_connected():
+            self.__connection.close()
+            self.__is_connected = False
+            logging.info("Datenbankverbindung geschlossen.")
+
+    def __enter__(self):
+        """Einstiegspunkt für den Kontext-Manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ausstiegspunkt für den Kontext-Manager, schließt die Verbindung."""
+        self.close()
+
+def load_config_from_toml(file_path: str, sektion: str, required_keys: list) -> dict:
+    """Lädt Konfigurationsdaten aus einer TOML-Datei."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {file_path}")
+
+    try:
+        with open(file_path, 'r') as f:
+            data = toml.load(f)
+            if not isinstance(data, dict):
+                raise ValueError(f"Ungültige Konfiguration: {file_path} enthält kein Wörterbuch.")
+
+            if sektion not in data:
+                raise ValueError(f"Fehlende '{sektion}'-Sektion in {file_path}.")
+
+            config_data = data[sektion]
+
+            for key in required_keys:
+                if key not in config_data:
+                    if key == "mqtt_get_topic_suffix":
+                        config_data[key] = None
+                    else:
+                        raise ValueError(f"Fehlender erforderlicher Schlüssel '{key}' in der '{sektion}'-Sektion von {file_path}.")
+
+            log_level_str = config_data.get("log_level", "INFO").upper()
+            config_data["log_level_value"] = getattr(logging, log_level_str, logging.INFO)
+
+            return config_data
+    except toml.TomlDecodeError as e:
+        raise ValueError(f"Fehler beim Decodieren von TOML aus {file_path}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Unerwarteter Fehler beim Lesen von {file_path}: {e}")
+
+# Die restlichen Funktionen bleiben unverändert, da sie vom Hauptprogramm aufgerufen werden.
+
+def Ausgabe(Ziel, Sensor, CRC, Temp, Bezeichnung, db, SensorID):
+    CSVSeperator = ";"
+    CSVListe = [time.strftime("%d.%m.%Y"), time.strftime("%H:%M"), Sensor, CRC, str(Temp).replace(".", ","), Bezeichnung]
+
+    if Ziel == "":
+        for x in CSVListe:
+            print(x, end=" ")
+        print()
+    elif Ziel == "db":
+        try:
+            # Jetzt verwenden wir den DatabaseManager
+            db.execute_query("INSERT INTO Bungalow.Tempwerte(Datum, Zeit, Temperatur, CRC, TempSensor_ID) VALUES (%s, %s, %s, %s, %s)",
+                             (time.strftime("%Y-%m-%d"), time.strftime("%H:%M:00"), Temp, CRC, SensorID), fetch_results=False)
+        except Exception as e:
+            logging.error(f"Fehler beim Einfügen in die Datenbank: {e}")
+    else:
+        try:
+            CSVOut = csv.writer(open(Ziel, "a"), delimiter=CSVSeperator)
+            CSVOut.writerow(CSVListe)
+        except FileNotFoundError as err:
+            print(time.strftime("%d.%m.%Y %H:%M:%S"), "CSV Datei oder Pfad nicht gefunden", file=sys.stderr)
+        except PermissionError as err:
+            print(time.strftime("%d.%m.%Y %H:%M:%S"), "Keine Berechtigung für Pfad", Ziel, file=sys.stderr)
+    return()
+
+def Schalten(Temp, Dose):
+    Programm = '/home/pi/Schalten'
+    SchaltenUeberhaupt = 7
+    Heizung_Ein = 3
+    Heizung_Aus = 5
+
+    if Temp < SchaltenUeberhaupt and Dose is not None:
+        sliste = [Programm, Dose]
+        if Temp <= Heizung_Ein:
+            sliste.append('1')
+        elif Temp >= Heizung_Aus:
+            sliste.append('0')
+        
+        try:
+            s = subprocess.Popen(sliste)
+        except FileNotFoundError:
+            print(time.strftime("%d.%m.%Y %H:%M:%S"), f"Programm {sliste[0]} nicht gefunden", file=sys.stderr)
+        else:
+            s.wait()
+    return()
+
+# Start Hauptprogramm
+# Konfiguration aus TOML-Datei laden
+try:
+    config = load_config_from_toml('/home/pi/.credentials.toml', 'temperatur', ['db_name', 'db_host', 'db_user', 'db_pwd'])
+    DB = config['db_name']
+    DBHost = config['db_host']
+    DBUser = config['db_user']
+    DBPwd = config['db_pwd']
+except (FileNotFoundError, ValueError, RuntimeError) as e:
+    print(time.strftime("%d.%m.%Y %H:%M:%S"), f"Konfigurationsfehler: {e}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    Bungalow = "'" + sys.argv[Eingabe_Index] + "'"
+    if len(sys.argv) == 2:
+        sys.argv.append("")
+    if len(sys.argv) > 4:
+        sys.argv[4:len(sys.argv)] = []
+
+    # Datenbankverbindung mit dem DatabaseManager
+    with DatabaseManager(DBHost, DB, DBUser, DBPwd) as db_manager:
+        if not db_manager.is_connected():
+            sys.exit(1)
+
+        # Abfrage Bungalows aus MySQLDB
+        query1 = f"SELECT Bezeichnung FROM Bungalow.Bungalow WHERE Bezeichnung = {Bungalow}"
+        result1 = db_manager.execute_query(query1)
+
+        if result1 and len(result1) == 1:
+            query2 = f"""
+                SELECT
+                    ts.SensorID,
+                    ts.Schalten,
+                    ts.Bezeichnung,
+                    ts.ID
+                FROM
+                    Bungalow.TempSensor ts
+                LEFT JOIN
+                    Bungalow.Bungalow b ON b.ID = ts.Bungalow_ID
+                WHERE
+                    b.Bezeichnung = {Bungalow}
+                ORDER BY
+                    ts.Bezeichnung
+            """
+            result2 = db_manager.execute_query(query2)
+
+            for data in result2:
+                try:
+                    w1_Device = open(w1_Pfad + data['SensorID'] + w1_Sensor, "r")
+                except FileNotFoundError:
+                    print(time.strftime("%d.%m.%Y %H:%M:%S"), f"Sensor {data['SensorID']} nicht gefunden", file=sys.stderr)
+                else:
+                    CRC = w1_Device.readline()[CRC_Pos:].rstrip()
+                    Temp = float(w1_Device.readline()[Temp_Pos:].rstrip()) / 1000
+                    w1_Device.close()
+
+                    if CRC == "YES":
+                        Schalten(Temp, data['Schalten'])
+
+                    for x in range(Ausgabe_Index, len(sys.argv)):
+                        Ausgabe(sys.argv[x], data['SensorID'], CRC, Temp, data['Bezeichnung'], db_manager, data['ID'])
+        else:
+            query_all_bungalows = "SELECT Bezeichnung FROM Bungalow.Bungalow"
+            all_bungalows = db_manager.execute_query(query_all_bungalows)
+            if all_bungalows:
+                print("Bezeichnung muss einem der folgenden Werte entsprechen:", [b['Bezeichnung'] for b in all_bungalows])
+            else:
+                print("Keine Bungalow-Bezeichnungen in der Datenbank gefunden.")
+
+except IndexError:
+    print(time.strftime("%d.%m.%Y %H:%M:%S"), "keine Bungalowbezeichnung", file=sys.stderr)
+    print("\nProgrammauruf")
+    print("Temperatur.py Bungalowbezeichnung [Ausgabedatei]|[db]")
+    print("\nBeispiel")
+    print("Temperatur.py B2                                Ausgabe nur auf stdout")
+    print("Temperatur.py B2 /home/pi/B2/Temperatur.csv     Ausgabe in angegebene csv Datei")
+    print("Temperatur.py B2 db                             Ausgabe in MySQL DB")
+    print("Temperatur.py B2 /home/pi/B2/Temperatur.csv db  Ausgabe in MySQL DB und csv Datei")
+    sys.exit(1)
+except Exception as e:
+    print(f"Ein unerwarteter Fehler ist aufgetreten: {e}", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(0)

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head lang="de-DE">
+    <meta charset="UTF-8">
+    <meta name="author" content="Maria Roscher">
+    <meta name="date" content="29.12.2023 16:30">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex">
+    <meta name="description" content="Prüfung des Zaehlen Daemon">
+    <title>Diagnose Zählen Daemon</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.2/dist/full.min.css" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #f8f9fa;
+        }
+        .message-row {
+            display: flex;
+            flex-wrap: wrap;
+            padding: 8px 0;
+            border-bottom: 1px dashed #e9ecef;
+            align-items: baseline;
+        }
+        .message-row:last-child {
+            border-bottom: none;
+        }
+        .message-col {
+            padding: 0 5px;
+        }
+        .message-col.timestamp {
+            width: 170px;
+            flex-shrink: 0;
+            color: #6c757d;
+            font-size: 0.85em;
+        }
+        .message-col.source-port {
+            width: 90px;
+            flex-shrink: 0;
+            color: #6f42c1;
+            font-weight: bold;
+            font-size: 0.85em;
+        }
+        .message-col.sender {
+            width: 140px;
+            flex-shrink: 0;
+            color: #007bff;
+            font-size: 0.85em;
+        }
+        .message-col.content {
+            flex-grow: 1;
+            word-break: break-all;
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+            background-color: #f0f8ff;
+            padding: 5px 10px;
+            border-radius: 0.25rem;
+            border: 1px solid #dee2e6;
+            margin-left: 10px;
+        }
+        /* Port-spezifische Farben beibehalten, da sie logikabhängig sind */
+        .port-5005 .message-col.content {
+            background-color: #e6ffee;
+            border-color: #28a745;
+        }
+        .port-5006 .message-col.content {
+            background-color: #fff3e0;
+            border-color: #ffc107;
+        }
+        .port-5007 .message-col.content {
+            background-color: #e0f2f7;
+            border-color: #17a2b8;
+        }
+        @media (max-width: 768px) {
+            .message-col.timestamp,
+            .message-col.source-port,
+            .message-col.sender,
+            .message-col.content {
+                width: 100%;
+                margin-left: 0;
+                margin-bottom: 5px;
+            }
+            .message-col.content {
+                margin-top: 5px;
+            }
+        }
+    </style>
+</head>
+<body class="bg-base-200">
+    <header>
+        <nav class="navbar bg-base-100">
+            <div class="navbar-start">
+                <div class="dropdown">
+                    <div tabindex="0" role="button" class="btn btn-ghost lg:hidden">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h8m-8 6h16" /></svg>
+                    </div>
+                    <ul tabindex="0" class="menu menu-sm dropdown-content mt-3 z-[1] p-2 shadow bg-base-100 rounded-box w-52">
+                        <li><a href="http://pipbh.b5.intern/SmartHome.html">Bungalow</a></li>
+                        <li><a href="http://pizuhause.roscher.intern/SmartHome.html">zu Hause</a></li>
+                        <li class="dropdown-end dropdown">
+                            <a tabindex="0" class="active">Diagnose</a>
+                            <ul class="dropdown-menu p-2 shadow-md bg-base-100 rounded-box w-52">
+                                <li><a href="Diagnose.html" class="active">Zählen Daemon</a></li>
+                                <li><a href="#">Weiteres folgt hier</a></li>
+                            </ul>
+                        </li>
+                    </ul>
+                </div>
+                <a class="btn btn-ghost text-xl">Bungalow B5</a>
+            </div>
+            <div class="navbar-center hidden lg:flex">
+                <ul class="menu menu-horizontal px-1">
+                    <li class="dropdown-end dropdown">
+                        <a tabindex="0">Smarthome Steuerung</a>
+                        <ul class="dropdown-menu p-2 shadow-md bg-base-100 rounded-box w-52">
+                            <li><a href="http://pipbh.b5.intern/SmartHome.html">Bungalow</a></li>
+                            <li><a href="http://pizuhause.roscher.intern/SmartHome.html">zu Hause</a></li>
+                        </ul>
+                    </li>
+                    <li class="dropdown-end dropdown">
+                        <a tabindex="0" class="active">Diagnose</a>
+                        <ul class="dropdown-menu p-2 shadow-md bg-base-100 rounded-box w-52">
+                            <li><a href="Diagnose.html" class="active">Zählen Daemon</a></li>
+                            <li><a href="#">Weiteres folgt hier</a></li>
+                            </ul>
+                        </li>
+                    </ul>
+                </div>
+            <div class="navbar-end">
+                <a class="btn btn-ghost">Home</a>
+            </div>
+        </nav>
+        <h1 class="text-4xl font-bold text-center mt-8">UDP Diagnose WebUI</h1>
+    </header>
+
+    <main class="container mx-auto px-4 mt-8">
+        <div class="card bg-base-100 shadow-xl mb-8">
+            <div class="card-body">
+                <div class="flex flex-row items-center justify-center space-x-4">
+                    <h2 class="card-title justify-center">Verbindungsstatus</h2>
+                    <span id="connectionStatus" class="badge badge-lg">Wird verbunden...</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="card bg-base-100 shadow-xl">
+            <div class="card-body">
+                <h2 class="card-title justify-center">Empfangene Nachrichten</h2>
+                <div id="messages" class="overflow-y-auto max-h-96">
+                    <p class="text-center text-gray-500">Warte auf Nachrichten...</p>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script src="scripts/js/Diagnose.js"></script>
+</body>
+</html>

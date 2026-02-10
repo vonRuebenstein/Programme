@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import asyncio
+import json
+import sys
+import subprocess
+import argparse
+import logging
+from datetime import datetime, date
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+import toml
+import mysql.connector
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, SpinnerColumn
+
+import paho.mqtt.client as mqtt
+
+# --- Konfiguration ---
+CREDENTIALS_FILE = Path("/home/pi/.credentials.toml")
+CREDENTIALS_SEKTION = "schalten"
+console = Console()
+
+def json_serializer(obj):
+    """Sorgt für PHP-kompatible Zeitstempel im JSON."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat().replace('T', ' ')
+    raise TypeError(f"Type {type(obj)} nicht serialisierbar")
+
+class DatabaseManager:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.conn = None
+
+    def _connect(self):
+        if not self.conn or not self.conn.is_connected():
+            self.conn = mysql.connector.connect(
+                host=self.cfg["db_host"],
+                database=self.cfg["db_name"],
+                user=self.cfg["db_user"],
+                password=self.cfg["db_pwd"],
+                autocommit=False
+            )
+
+    def execute(self, query: str, params: tuple = None, fetch: bool = True) -> Any:
+        try:
+            self._connect()
+            cursor = self.conn.cursor(dictionary=True)
+            cursor.execute(query, params)
+            if fetch:
+                res = cursor.fetchall()
+                cursor.close()
+                return res
+            self.conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            if self.conn: self.conn.rollback()
+            return None
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn: self.conn.close()
+
+class Dose:
+    def __init__(self, db: DatabaseManager, config: dict, identifier: str = None):
+        self.db = db
+        self.config = config
+        self.params = self._load(identifier) if identifier else None
+
+    def _load(self, identifier: str) -> Optional[dict]:
+        # SELECT * stellt sicher, dass alle Felder (ID, Bemerkung etc.) dabei sind
+        query = "SELECT * FROM Bungalow.FSteckdosen WHERE Bezeichnung = %s OR Kurzname = %s"
+        res = self.db.execute(query, (identifier, identifier))
+        return res[0] if res else None
+
+    async def schalten_async(self, status: int, versuche: int) -> bool:
+        status_label = "ON" if status == 1 else "OFF"
+        success = False
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(complete_style="green", finished_style="bold green"), # Stile erzwingen
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True 
+        ) as progress:
+            
+            # Wir nutzen 100 als Festwert für die Prozentanzeige
+            task = progress.add_task(
+                f"[yellow]Bereite {self.params['Bezeichnung']} vor...", 
+                total=100
+            )
+            
+            if self.params.get('MQTT'):
+                # Phase 1: Verbinden
+                progress.update(task, description=f"[blue]MQTT: Verbinde Broker...", completed=20)
+                await asyncio.sleep(0.1) # Kurze Pause für die Optik
+                
+                # Phase 2: Senden
+                progress.update(task, description=f"[blue]MQTT: Sende {status_label}...", completed=50)
+                success = await self._mqtt_publish_async(status)
+                
+                if success:
+                    # Phase 3: Erfolg visualisieren
+                    progress.update(task, description=f"[bold green]MQTT: Bestätigt!", completed=100)
+                    # WICHTIG: Ein kurzes Sleep, damit das Terminal das "Grün" auch anzeigt
+                    await asyncio.sleep(0.4) 
+                else:
+                    progress.update(task, description="[bold red]MQTT: Timeout!", completed=100)
+                    await asyncio.sleep(0.4)
+            else:
+                # 433MHz Logik
+                step = 100 / versuche
+                for i in range(versuche):
+                    progress.update(task, description=f"[yellow]Funk: Sende Salve {i+1}/{versuche}...")
+                    res = await self._433mhz_execute_async(status)
+                    if res: success = True 
+                    progress.update(task, advance=step)
+                    await asyncio.sleep(0.1)
+                progress.update(task, completed=100)
+
+        # Nach der Bar die finale Text-Bestätigung (nur im interaktiven Terminal)
+        if success:
+            self._update_db(status)
+            if sys.stdout.isatty():
+                color = "green" if status == 1 else "red"
+                console.print(f"[bold green]✔[/bold green] [white]{self.params['Bezeichnung']}[/white] ist jetzt [bold {color}]{status_label}[/bold {color}]")
+        elif sys.stdout.isatty():
+            console.print(f"[bold red]✘ Fehler beim Schalten von {self.params['Bezeichnung']}[/bold red]")
+            
+        return success
+
+        if success:
+            self._update_db(status)
+            if sys.stdout.isatty():
+                color = "green" if status == 1 else "red"
+                console.print(f"[bold green]✔[/bold green] [white]{self.params['Bezeichnung']}[/white] ist jetzt [bold {color}]{status_label}[/bold {color}]")
+        return success
+
+    async def _mqtt_publish_async(self, status: int) -> bool:
+        loop = asyncio.get_running_loop()
+        topic = f"{self.params['MQTT']}/set"
+        payload = json.dumps({"state": "ON" if status == 1 else "OFF"})
+        def _sync_publish():
+            client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+            client.username_pw_set(self.config["mqtt_user"], self.config["mqtt_pwd"])
+            try:
+                client.connect(self.config["mqtt_host"], int(self.config["mqtt_port"]), 5)
+                info = client.publish(topic, payload, qos=1)
+                info.wait_for_publish(timeout=3)
+                client.disconnect()
+                return info.rc == mqtt.MQTT_ERR_SUCCESS
+            except: return False
+        return await loop.run_in_executor(None, _sync_publish)
+
+    async def _433mhz_execute_async(self, status: int) -> bool:
+        is_lernfaehig = self.params.get('Protokoll') and self.params.get('Pulse')
+        prog_path = Path(self.config["codesend_path"] if is_lernfaehig else self.config["send_path"])
+        if not prog_path.exists(): return False
+        args = [self.params[f"Code{status}"], self.params["Protokoll"], self.params["Pulse"]] if is_lernfaehig else [self.params["Code0"], self.params["Code1"], str(status)]
+        cmd = [str(prog_path)] + [str(a) for a in args]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await proc.wait()
+        return proc.returncode == 0
+
+    def _update_db(self, status: int):
+        query = "UPDATE Bungalow.FSteckdosen SET Status = %s, Zeitstempel = %s WHERE Bezeichnung = %s"
+        self.db.execute(query, (status, datetime.now(), self.params['Bezeichnung']), fetch=False)
+
+def _format_val(k, v):
+    if k == "Status":
+        return Text(" ON ", style="white on green bold") if v in [1, True, "ON"] else Text(" OFF ", style="bright_red on white bold")
+    if isinstance(v, datetime):
+        return v.strftime("%d.%m.%Y %H:%M")
+    return str(v) if v is not None else ""
+
+def show_table(data: List[Dict[str, Any]], orientation: str = "spalte"):
+    if not data: return
+    table = Table(header_style="bold magenta", box=None)
+    keys = list(data[0].keys())
+    if orientation.lower() == "spalte":
+        for key in keys: table.add_column(key)
+        for row in data: table.add_row(*[_format_val(k, row[k]) for k in keys])
+    else:
+        table.add_column("Merkmal", style="bold cyan")
+        for row in data: table.add_column(str(row.get("Bezeichnung", "Dose")))
+        for key in keys:
+            if key == "Bezeichnung": continue
+            row_cells = [key]
+            for item in data: row_cells.append(_format_val(key, item.get(key)))
+            table.add_row(*row_cells)
+    console.print(table)
+
+async def main():
+    try:
+        cfg = toml.load(str(CREDENTIALS_FILE))[CREDENTIALS_SEKTION]
+    except Exception:
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(prog="Schalten")
+    parser.add_argument("dose", nargs="?")
+    parser.add_argument("status", nargs="?", choices=["0", "1"], default="0")
+    parser.add_argument("-A", "--all", choices=["spalte", "zeile"])
+    parser.add_argument("-a", "--anzeigen", action="store_true") # Für Server-Kompatibilität
+    args = parser.parse_args()
+
+    with DatabaseManager(cfg) as db:
+        if args.all or (args.anzeigen and not args.dose):
+            data = db.execute("SELECT * FROM Bungalow.FSteckdosen WHERE Bezeichnung IS NOT NULL ORDER BY Fernbedienung, Kanal")
+            if sys.stdout.isatty():
+                show_table(data, args.all or "spalte")
+            else:
+                print(json.dumps(data, default=json_serializer))
+        
+        elif args.dose:
+            dose = Dose(db, cfg, args.dose)
+            if dose.params:
+                success = await dose.schalten_async(int(args.status), 3)
+                if not sys.stdout.isatty():
+                    # WICHTIG: Das Ergebnis in ein ARRAY [] packen, damit PHP zufrieden ist
+                    print(json.dumps([dose._load(args.dose)], default=json_serializer))
+                elif success:
+                    color = "green" if args.status == "1" else "red"
+                    label = "ON" if args.status == "1" else "OFF"
+                    console.print(f"[bold green]✔[/bold green] {dose.params['Bezeichnung']} ist jetzt [bold {color}]{label}[/bold {color}]")
+            else:
+                sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())

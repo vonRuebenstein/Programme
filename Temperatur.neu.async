@@ -1,0 +1,430 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import logging
+import asyncio
+import subprocess
+import argparse
+import toml
+import time
+import json
+import sys
+import csv
+import os
+import aiomysql
+from typing import Dict, List, Any
+
+# Importe für rich
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+def find_w1_master_path():
+    """
+    Findet den Hauptpfad zum W1-Bus dynamisch.
+    Durchsucht /sys/bus/w1/devices nach dem Master-Bus.
+    """
+    base_path = '/sys/bus/w1/devices/'
+    if not os.path.exists(base_path):
+        logging.critical(f"Der W1-Bus-Pfad '{base_path}' existiert nicht. Überprüfen Sie, ob der W1-Kernel-Treiber geladen ist.")
+        return None
+    
+    for device_name in os.listdir(base_path):
+        if device_name.startswith("w1_bus_master"):
+            logging.info(f"Dynamisch den W1-Bus-Master-Pfad gefunden: {base_path + device_name}")
+            return os.path.join(base_path, device_name, '')
+    
+    logging.critical(f"Kein 'w1_bus_master' im Pfad '{base_path}' gefunden.")
+    return None
+
+class AsyncDatabaseManager:
+    """
+    Verwaltet die asynchrone Datenbankverbindung und -operationen.
+    Verwendet aiomysql.
+    """
+    RETRY_ATTEMPTS = 5
+    RETRY_DELAY_BASE = 2
+
+    def __init__(self, db_host, db_name, db_user, db_pwd):
+        self.__db_host = db_host
+        self.__db_name = db_name
+        self.__db_user = db_user
+        self.__db_pwd = db_pwd
+        self.__pool = None
+
+    async def _connect(self):
+        """Versucht, eine asynchrone Verbindung zum Pool aufzubauen."""
+        for attempt in range(self.RETRY_ATTEMPTS):
+            try:
+                self.__pool = await aiomysql.create_pool(
+                    host=self.__db_host,
+                    db=self.__db_name,
+                    user=self.__db_user,
+                    password=self.__db_pwd,
+                    autocommit=False,
+                    loop=asyncio.get_event_loop()
+                )
+                logging.info("Erfolgreich mit dem Datenbank-Pool verbunden.")
+                return True
+            except aiomysql.Error as err:
+                logging.warning(f"Verbindungsversuch {attempt + 1}/{self.RETRY_ATTEMPTS} fehlgeschlagen: {err}")
+                if attempt < self.RETRY_ATTEMPTS - 1:
+                    delay = self.RETRY_DELAY_BASE * (2 ** attempt)
+                    logging.info(f"Warte {delay} Sekunden vor dem nächsten Verbindungsversuch...")
+                    await asyncio.sleep(delay)
+                else:
+                    logging.critical(f"Alle {self.RETRY_ATTEMPTS} Verbindungsversuche fehlgeschlagen. Programm wird beendet.")
+                    sys.exit(1)
+        return False
+    
+    async def execute_query(self, query: str, params=None, fetch_results=True):
+        """
+        Führt eine asynchrone SQL-Abfrage aus.
+        """
+        if self.__pool is None:
+            logging.error("Datenbank-Pool ist nicht initialisiert.")
+            return None
+
+        async with self.__pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                try:
+                    logging.debug(f"Ausführen der SQL-Abfrage: {query}")
+                    await cursor.execute(query, params)
+
+                    if query.strip().upper().startswith("SELECT") and fetch_results:
+                        results = await cursor.fetchall()
+                        logging.debug(f"Abfrage erfolgreich, {len(results)} Zeilen zurückgegeben.")
+                        return results
+                    else:
+                        await conn.commit()
+                        logging.debug("Änderungen an der Datenbank festgeschrieben.")
+                        return True
+                except aiomysql.Error as err:
+                    logging.error(f"Datenbankfehler bei Ausführung von Query: '{query}' - {err}")
+                    await conn.rollback()
+                    return False
+
+    async def close(self):
+        if self.__pool:
+            self.__pool.close()
+            await self.__pool.wait_closed()
+            logging.info("Datenbank-Pool geschlossen.")
+            
+    async def __aenter__(self):
+        await self._connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
+def load_config_from_toml(file_path: str, sektion: str, required_keys: list) -> dict:
+    """Lädt Konfigurationsdaten aus einer TOML-Datei."""
+    if not os.path.exists(file_path):
+        logging.critical(f"Konfigurationsdatei nicht gefunden: {file_path}")
+        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {file_path}")
+
+    try:
+        with open(file_path, 'r') as f:
+            data = toml.load(f)
+            if not isinstance(data, dict):
+                logging.error(f"Ungültige Konfiguration: {file_path} enthält kein Wörterbuch.")
+                raise ValueError(f"Ungültige Konfiguration: {file_path} enthält kein Wörterbuch.")
+
+            if sektion not in data:
+                logging.error(f"Fehlende '{sektion}'-Sektion in {file_path}.")
+                raise ValueError(f"Fehlende '{sektion}'-Sektion in {file_path}.")
+
+            config_data = data[sektion]
+
+            for key in required_keys:
+                if key not in config_data:
+                    if key == "mqtt_get_topic_suffix":
+                        config_data[key] = None
+                    else:
+                        logging.error(f"Fehlender erforderlicher Schlüssel '{key}' in der '{sektion}'-Sektion.")
+                        raise ValueError(f"Fehlender erforderlicher Schlüssel '{key}' in der '{sektion}'-Sektion.")
+
+            log_level_str = config_data.get("log_level", "INFO").upper()
+            config_data["log_level_value"] = getattr(logging, log_level_str, logging.INFO)
+
+            logging.info(f"Konfiguration aus {file_path} geladen. Logging-Level auf '{log_level_str}' gesetzt.")
+            return config_data
+    except toml.TomlDecodeError as e:
+        logging.critical(f"Fehler beim Decodieren von TOML aus {file_path}: {e}")
+        raise ValueError(f"Fehler beim Decodieren von TOML aus {file_path}: {e}")
+    except Exception as e:
+        logging.critical(f"Unerwarteter Fehler beim Lesen von {file_path}: {e}")
+        raise RuntimeError(f"Unerwarteter Fehler beim Lesen von {file_path}: {e}")
+
+def _exec_schaltbefehl(programm, dose, befehl):
+    """Führt den eigentlichen Schaltbefehl mit subprocess aus."""
+    sliste = [programm, dose, befehl]
+    try:
+        logging.info(f"Führe Schaltbefehl aus: {' '.join(sliste)}")
+        s = subprocess.Popen(sliste)
+        s.wait()
+    except FileNotFoundError:
+        logging.error(f"Programm {sliste[0]} nicht gefunden.")
+    except Exception as e:
+        logging.error(f"Fehler bei der Ausführung des Schaltbefehls: {e}", exc_info=True)
+
+def schalten(temp, dose):
+    """
+    Bestimmt basierend auf der Temperatur den Schaltbefehl und ruft ihn auf.
+    """
+    programm = '/home/pi/Schalten'
+    schalten_ueberhaupt = 7
+    heizung_ein = 3
+    heizung_aus = 5
+
+    if temp is not None and temp < schalten_ueberhaupt and dose is not None:
+        if temp <= heizung_ein:
+            _exec_schaltbefehl(programm, dose, '1')
+        elif temp >= heizung_aus:
+            _exec_schaltbefehl(programm, dose, '0')
+
+class TempSensor:
+    """Repräsentiert einen Temperatursensor und seine Daten."""
+    def __init__(self, data: Dict[str, Any], args: argparse.Namespace, w1_path: str):
+        self.data = data
+        self.args = args
+        self.w1_path = w1_path
+
+    def _read_w1_file(self):
+        """
+        Blockierende Funktion zum Lesen einer W1-Sensordatei.
+        Sucht nach 'crc=' und 't=' anstatt auf feste Positionen zu vertrauen.
+        """
+        sensor_id = self.data['SensorID']
+        sensor_file_path = os.path.join(self.w1_path, sensor_id, 'w1_slave')
+        
+        try:
+            with open(sensor_file_path, "r") as w1_device:
+                lines = w1_device.readlines()
+                crc_line = lines[0].strip()
+                temp_line = lines[1].strip()
+                
+                # CRC extrahieren
+                crc = crc_line.split(' ')[-1]
+                
+                # Temperatur extrahieren
+                if "t=" in temp_line:
+                    temp = float(temp_line.split('t=')[-1].strip()) / 1000
+                else:
+                    temp = None
+                
+                logging.debug(f"Sensor {sensor_id} erfolgreich gelesen. CRC: {crc}, Temp: {temp}")
+                return crc, temp
+        except FileNotFoundError:
+            logging.error(f"Sensor {sensor_id} nicht gefunden unter {sensor_file_path}")
+            return None, None
+        except (ValueError, IndexError) as e:
+            logging.error(f"Fehler beim Parsen der Sensordaten für {sensor_id}: {e}", exc_info=True)
+            return None, None
+        except Exception as e:
+            logging.error(f"Unerwarteter Fehler beim Lesen des Sensors {sensor_id}: {e}", exc_info=True)
+            return None, None
+
+    async def read_and_process_data(self):
+        """
+        Asynchrone Coroutine zum Lesen und Verarbeiten der Sensordaten.
+        """
+        sensor_id = self.data['SensorID']
+        logging.info(f"Starte Leseoperation für Sensor {sensor_id}.")
+
+        crc, temp = await asyncio.to_thread(self._read_w1_file)
+        
+        # Füge die gelesenen Werte und den Zeitstempel zum Dictionary hinzu
+        self.data['CRC'] = crc
+        self.data['Temp'] = temp
+        self.data['Datum'] = time.strftime("%d.%m.%Y")
+        self.data['Zeit'] = time.strftime("%H:%M")
+        self.data['Zeit_DB'] = time.strftime("%H:%M:00")
+        self.data['Datum_DB'] = time.strftime("%Y-%m-%d")
+        
+        # Schaltfunktion aufrufen
+        if crc == "YES" and temp is not None:
+            logging.info(f"Temperatur für Sensor {sensor_id} ist gültig ({temp}°C).")
+            # Aufruf der globalen Schaltfunktion
+            schalten(temp, self.data.get('Schalten'))
+        else:
+            logging.warning(f"Sensor {sensor_id} hat eine ungültige CRC-Prüfsumme: {crc} oder Daten fehlen.")
+
+    async def write_to_db(self, db_manager):
+        """Schreibt die Sensordaten asynchron in die Datenbank."""
+        if self.data.get('CRC') == "YES" and self.data.get('Temp') is not None and self.args.db:
+            try:
+                query = "INSERT INTO Bungalow.Tempwerte(Datum, Zeit, Temperatur, CRC, TempSensor_ID) VALUES (%s, %s, %s, %s, %s)"
+                params = (self.data.get('Datum_DB'), self.data.get('Zeit_DB'), self.data.get('Temp'), self.data.get('CRC'), self.data.get('ID'))
+                await db_manager.execute_query(query, params, fetch_results=False)
+                logging.info(f"Daten für Sensor {self.data.get('SensorID')} in DB geschrieben.")
+            except Exception as e:
+                logging.error(f"Fehler beim Einfügen in die Datenbank für Sensor {self.data.get('SensorID')}: {e}")
+    
+    def write_to_csv(self):
+        """Schreibt die Sensordaten in eine CSV-Datei."""
+        if self.data.get('CRC') == "YES" and self.data.get('Temp') is not None and self.args.csv:
+            csv_path = self.args.csv if self.args.csv is not True else f'/home/pi/Bungalows/{self.args.bungalow}/Temperatur.csv'
+            try:
+                with open(csv_path, "a", newline='') as f:
+                    writer = csv.writer(f, delimiter=';')
+                    row_data = [self.data.get('Datum'), self.data.get('Zeit'), self.data.get('SensorID'), self.data.get('CRC'), str(self.data.get('Temp')).replace('.', ','), self.data.get('Bezeichnung')]
+                    writer.writerow(row_data)
+                    logging.info(f"Daten für Sensor {self.data.get('SensorID')} in CSV geschrieben.")
+            except (FileNotFoundError, PermissionError) as err:
+                logging.error(f"Fehler beim Schreiben der CSV-Datei für Sensor {self.data.get('SensorID')}: {err}")
+
+    def display(self, table: Table):
+        """Fügt die Sensordaten zur Rich-Tabelle hinzu."""
+        row_data = []
+        for key in ['Datum', 'Zeit', 'SensorID', 'Bezeichnung', 'CRC', 'Temp']:
+            if key == 'Temp':
+                temp = self.data.get(key)
+                temp_str = f"{temp:.3f} °C" if temp is not None else "N/A"
+                
+                if temp is not None:
+                    if temp < 15:
+                        temp_text = Text(temp_str, style="red bold")
+                    else:
+                        temp_text = Text(temp_str, style="green")
+                else:
+                    temp_text = Text(temp_str, style="red bold")
+                
+                row_data.append(temp_text)
+            else:
+                row_data.append(str(self.data.get(key, 'N/A')))
+        table.add_row(*row_data)
+
+async def main():
+    """Hauptfunktion des Skripts."""
+    is_terminal = sys.stdout.isatty()
+    if is_terminal:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+
+    parser = argparse.ArgumentParser(description='Ein Skript zur Temperaturmessung und -protokollierung.')
+    parser.add_argument('bungalow', type=str, help='Die Bezeichnung des Bungalows.')
+    parser.add_argument('-d', '--db', action='store_true', help='Protokolliert die Daten in der Datenbank.')
+    parser.add_argument('-c', '--csv', nargs='?', const=True, help='Protokolliert die Daten in einer CSV-Datei.')
+    parser.add_argument('-e', '--extrema', action='store_true', help='Gibt die Extremwerte aus der Datenbank aus.')
+    args = parser.parse_args()
+
+    # Konfiguration laden
+    try:
+        config_data = load_config_from_toml('/home/pi/.credentials.toml', 'temperatur', ['db_host', 'db_name', 'db_user', 'db_pwd', 'log_level'])
+        logging.getLogger().setLevel(config_data["log_level_value"])
+    except Exception as e:
+        print(f"Fehler beim Laden der Konfiguration: {e}", file=sys.stderr)
+        sys.exit(1)
+        
+    try:
+        async with AsyncDatabaseManager(config_data['db_host'], config_data['db_name'], config_data['db_user'], config_data['db_pwd']) as db_manager:
+            if args.extrema:
+                # Extremwerte-Logik
+                query_extrema = f"SELECT * FROM Bungalow.TemperaturExtremwerte"
+                extrema_data = await db_manager.execute_query(query_extrema)
+                
+                if not extrema_data:
+                    logging.warning(f"Keine Extremwerte für Bungalow '{args.bungalow}' in der Datenbank gefunden.")
+                
+                if is_terminal:
+                    # Ausgabe als Rich-Tabelle
+                    console = Console()
+                    table = Table(title=f"Extremwerte für {args.bungalow}")
+                    table.add_column("Sensor", justify="left", style="cyan", no_wrap=True)
+                    table.add_column("Tag", justify="left", style="magenta", no_wrap=True)
+                    table.add_column("Max Temp", justify="right", style="red bold", no_wrap=True)
+                    table.add_column("Min Temp", justify="right", style="blue bold", no_wrap=True)
+                    
+                    for row in extrema_data:
+                        table.add_row(
+                            row['Bezeichnung'],
+                            str(row['Datum']),
+                            f"{row['MaxTemp']:.2f} °C",
+                            f"{row['MinTemp']:.2f} °C"
+                        )
+                    console.print(table)
+                else:
+                    # Ausgabe als JSON
+                    print(json.dumps(extrema_data, indent=4))
+                    
+                sys.exit(0)
+            
+            # Normale Sensor-Lese-Logik
+            w1_path = find_w1_master_path()
+            if not w1_path:
+                sys.exit(1)
+            
+            query1 = f"SELECT ID FROM Bungalow.Bungalow WHERE Bezeichnung = '{args.bungalow}'"
+            bungalow_id_data = await db_manager.execute_query(query1)
+            
+            if bungalow_id_data:
+                bungalow_id = bungalow_id_data[0]['ID']
+                logging.info(f"Bungalow-ID für '{args.bungalow}' gefunden: {bungalow_id}")
+                
+                query2 = f"""
+                    SELECT
+                        ts.Bezeichnung, ts.ID, ts.SensorID, ts.Schalten
+                    FROM
+                        Bungalow.TempSensor ts
+                    LEFT JOIN
+                        Bungalow.Bungalow b ON b.ID = ts.Bungalow_ID
+                    WHERE
+                        b.Bezeichnung = '{args.bungalow}'
+                    ORDER BY
+                        ts.Bezeichnung
+                """
+                sensoren_data = await db_manager.execute_query(query2)
+                
+                if not sensoren_data:
+                    logging.warning(f"Keine Sensoren für Bungalow '{args.bungalow}' gefunden.")
+                    sys.exit(0)
+
+                # Erstelle eine Liste von TempSensor-Objekten
+                sensors = [TempSensor(data, args, w1_path) for data in sensoren_data]
+                
+                # Führe Lese- und Verarbeitungstasks asynchron aus
+                await asyncio.gather(*[s.read_and_process_data() for s in sensors])
+
+                # Je nach Flaggen Daten in DB oder CSV schreiben
+                db_tasks = [s.write_to_db(db_manager) for s in sensors if args.db]
+                await asyncio.gather(*db_tasks)
+                
+                for s in sensors:
+                    s.write_to_csv()
+
+                if is_terminal and not args.db and not args.csv:
+                    # Ausgabe als Rich-Tabelle nur im Terminal und ohne -d/-c
+                    console = Console()
+                    table = Table(title=f"Sensordaten für {args.bungalow}")
+                    for key in ['Datum', 'Zeit', 'SensorID', 'Bezeichnung', 'CRC', 'Temp']:
+                        table.add_column(key, justify="left", style="cyan", no_wrap=True)
+                    
+                    for sensor in sensors:
+                        sensor.display(table)
+                    
+                    console.print(table)
+                elif not is_terminal:
+                    # Ausgabe als JSON, wenn nicht im Terminal
+                    results = [s.data for s in sensors]
+                    print(json.dumps(results, indent=4))
+                
+            else:
+                logging.warning(f"Bungalow-Bezeichnung '{args.bungalow}' nicht in der Datenbank gefunden.")
+                query_all_bungalows = "SELECT Bezeichnung FROM Bungalow.Bungalow"
+                all_bungalows = await db_manager.execute_query(query_all_bungalows)
+                if all_bungalows:
+                    logging.info("Verfügbare Bungalow-Bezeichnungen: " + ", ".join([b['Bezeichnung'] for b in all_bungalows]) + "")
+                else:
+                    logging.info("Keine Bungalow-Bezeichnungen in der Datenbank gefunden.")
+
+    except Exception as e:
+        logging.critical(f"Ein unerwarteter Fehler ist aufgetreten: {e}", exc_info=True)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Programm durch Benutzer beendet.")
+    sys.exit(0)
