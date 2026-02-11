@@ -1,11 +1,11 @@
 <?php
     // Fehlerberichterstattung und Logging
     error_reporting(E_ALL);
-    ini_set('display_errors', 0); // Fehler nicht im Browser anzeigen
+    ini_set('display_errors', 1); // Fehler nicht im Browser anzeigen
     ini_set('log_errors', 1);     // Fehler ins Log schreiben
     ini_set('error_log', '/var/log/php_errors.log'); // Pfad zur PHP-Fehlerlogdatei
 
-    require_once __DIR__ . '/../../scripts/vendor/autoload.php';
+    require_once __DIR__ . '/../scripts/vendor/autoload.php';
     use Yosymfony\Toml\Toml;
 
     // Pfad zur TOML-Datei für Anmeldeinformationen
@@ -16,12 +16,6 @@
     $db_user = '';
     $db_pwd = '';
     $db_name = '';
-
-    // Verbindung zum Datenbankserver
-    //$db_host = "localhost";
-    //$db_user = "temp";
-    //$db_pwd = "24021965{temp}";
-    //$db_name = "Bungalow";
 
     try {
         if (!file_exists($credentials_file)) {
@@ -40,7 +34,9 @@
             $db_host = $config['temperatur']['db_host'] ?? '';
             $db_user = $config['temperatur']['db_user'] ?? '';
             $db_pwd = $config['temperatur']['db_pwd'] ?? '';
-            $db_name = $config['temperatur']['db_name'] ?? '';
+            $db_name = $config['temperatur']['db_name'] ?? ''; // Verbindung zum Datenbankserver
+    
+
         } else {
             throw new Exception("Der Abschnitt '[temperatur]' oder der benötigte Datenbankabschnitt wurde in der TOML-Datei nicht gefunden.");
         }
@@ -53,7 +49,7 @@
         error_log('Fehler beim Laden der Anmeldeinformationen: ' . $e->getMessage());
         http_response_code(500);
         echo json_encode(["status" => "error", "message" => "Interner Serverfehler: Konfigurationsproblem. Details im Fehlerlog."]);
-        exit;
+       exit;
     }
 
 
