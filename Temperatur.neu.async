@@ -339,9 +339,9 @@ async def main():
                     for row in extrema_data:
                         table.add_row(
                             row['Bezeichnung'],
-                            str(row['Datum']),
-                            f"{row['MaxTemp']:.2f} °C",
-                            f"{row['MinTemp']:.2f} °C"
+                            str(row['Zeitpunkt']),
+                            f"{row['Temperatur']:.3f} °C",
+                            f"{row['Temperatur']:.3f} °C"
                         )
                     console.print(table)
                 else:
