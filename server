@@ -33,190 +33,85 @@ udp_listener_transports = []
 
 # --- NEUE KLASSE FÜR DIE WEBSOCKET-NACHRICHTENVERARBEITUNG ---
 class WebSocketMessageHandler:
-    """Verarbeitet eingehende Nachrichten von einem einzelnen WebSocket-Client."""
+    def __init__(self, server):
+        self.server = server
+        self.log = logging.getLogger("WebSocketHandler")
 
-    def __init__(self, websocket):
-        self.websocket = websocket
-        self.remote_address = websocket.remote_address
-        self.log = logging.getLogger(__name__)
-
-    async def _subscribe(self, ports):
-        """Fügt Ports zur Abonnement-Liste des Clients hinzu."""
-        if self.websocket not in connected_websockets:
-            connected_websockets[self.websocket] = set()
-        
-        for port in ports:
-            connected_websockets[self.websocket].add(port)
-        
-        self.log.info(f"Client {self.remote_address} abonniert Ports: {ports}")
-
-    async def _unsubscribe(self, ports):
-        """Entfernt Ports aus der Abonnement-Liste des Clients."""
-        if self.websocket in connected_websockets:
-            for port in ports:
-                connected_websockets[self.websocket].discard(port)
-            self.log.info(f"Client {self.remote_address} de-abonniert Ports: {ports}")
-    
-    async def log_connected_clients(self):
-        """Protokolliert die Anzahl der verbundenen Clients und deren Abonnements."""
-        num_clients = len(connected_websockets)
-        self.log.info(f"Aktuell verbundene WebSocket-Clients: {num_clients}")
-        for client, ports in connected_websockets.items():
-            ports_str = ', '.join(map(str, sorted(list(ports))))
-            self.log.info(f" -> Client {client.remote_address} abonniert Ports: {ports_str}")
-
-    async def handle_messages(self, message):
-        """Verarbeitet eingehende Nachrichten vom Client."""
+    async def handle_message(self, websocket, message):
         try:
             data = json.loads(message)
             action = data.get("action")
-            self.log.info(f"Aktion vom Client {self.remote_address} empfangen: {action}")
+            self.log.info(f"Empfangene Action: {action}")
 
-            # Bestehende Funktionalität für Abonnements
-            if action == "subscribe":
-                ports = data.get("ports", [])
-                await self._subscribe(ports)
-                await self.log_connected_clients()
-            elif action == "unsubscribe":
-                ports = data.get("ports", [])
-                await self._unsubscribe(ports)
-                await self.log_connected_clients()
-            
-            # Neue Funktionalität für Datenanfrage
-            elif action == "request_all_doses":
-                self.log.info("Anfrage zum Abrufen aller Steckdosen-Daten empfangen.")
-                
-                # Befehl unter Verwendung des Python-Interpreters aus der venv
-                command = "/home/pi/venv_Schalten/bin/python /home/pi/Schalten -A spalte"
-                
-                self.log.info(f"Befehl zum Abrufen der Daten wird ausgeführt: {command}")
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await proc.communicate()
-
-                if proc.returncode == 0:
-                    response = {
-                        "action": "getData-response",
-                        "status": "success",
-                        "data": stdout.decode().strip()
-                    }
-                else:
-                    response = {
-                        "action": "getData-response",
-                        "status": "error",
-                        "message": "Fehler beim Abrufen der Steckdosen-Daten.",
-                        "details": stderr.decode().strip()
-                    }
-                
-                await self.websocket.send(json.dumps(response))
-
-            # Neue Funktionalität für Schaltbefehle
-            #elif action == "schalten":
-            #     dose_bezeichnung = data['data']['bezeichnung']
-            #     status = data['data']['status']
-                
-            #     # Befehl unter Verwendung des Python-Interpreters aus der venv
-            #     command = f"/home/pi/venv_Schalten/bin/python /home/pi/Schalten {dose_bezeichnung} {status} -a"
-                
-            #     self.log.info(f"Schaltbefehl wird ausgeführt: {command}")
-            #     proc = await asyncio.create_subprocess_shell(
-            #         command,
-            #         stdout=asyncio.subprocess.PIPE,
-            #         stderr=asyncio.subprocess.PIPE
-            #     )
-            #     stdout, stderr = await proc.communicate()
-                
-            #     response_data = {
-            #         "action": "Schalten-Response",
-            #         "bezeichnung": dose_bezeichnung,
-            #         "status": "success" if proc.returncode == 0 else "error",
-            #         "message": stdout.decode().strip(),
-            #         "details": stderr.decode().strip()
-            #     }
-            #     await self.websocket.send(json.dumps(response_data))
-            #     #await send_to_websockets(response_data, broadcast_all=True)
-            #     await send_to_websockets(dose_array[0], broadcast_all=True)
-
-            # Unerwartete Aktionen
+            if action == "get_all":
+                # Initiales Laden aller Dosen beim Seitenaufruf
+                await self.send_all_steckdosen(websocket)
 
             elif action == "Schalten":
-                self.log.info(f"Schaltbefehl für '{data.get('bezeichnung')}' auf Status {data.get('status')} empfangen.")
-                
-                subprocess_command = f"/home/pi/venv_Schalten/bin/python /home/pi/Schalten {data.get('bezeichnung')} {data.get('status')} -a"
-                
-                proc = await asyncio.create_subprocess_shell(
-                    subprocess_command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                stdout, stderr = await proc.communicate()
-                
-                response_to_client = None  # Stellt sicher, dass die Variable immer definiert ist
-                
-                if proc.returncode == 0:
-                    response_data_str = stdout.decode('utf-8')
-                    
-                    try:
-                        json_start_index = response_data_str.find('[')
-                        if json_start_index != -1:
-                            json_string = response_data_str[json_start_index:]
-                            dose_array = json.loads(json_string)
-                            if dose_array and isinstance(dose_array, list) and len(dose_array) > 0:
-                                
-                                # **KORREKTUR**: Sende die Statusdaten als Broadcast an ALLE Clients
-                                await send_to_websockets(dose_array[0], broadcast_all=True)
-                                self.log.info("Schalt-Update als Broadcast an alle Clients gesendet.")
-                            else:
-                                self.log.error(f"Ungültige oder leere JSON-Antwort von Schalten-Skript: {response_data_str}")
-                                response_to_client = {
-                                    "action": "Schalten-Response",
-                                    "status": "error",
-                                    "message": "Serverfehler: Ungültige oder leere JSON-Antwort von Schalten-Skript.",
-                                    "details": response_data_str
-                                }
-                        else:
-                            self.log.error(f"Kein JSON-Array in der Antwort von Schalten-Skript gefunden: {response_data_str}")
-                            response_to_client = {
-                                "action": "Schalten-Response",
-                                "status": "error",
-                                "message": "Serverfehler: Kein JSON-Array in der Skript-Antwort.",
-                                "details": response_data_str
-                            }
-
-                    except json.JSONDecodeError as e:
-                        self.log.error(f"Fehler beim Parsen der JSON-Antwort von Schalten-Skript: {e}. Antwort: {response_data_str}")
-                        response_to_client = {
-                            "action": "Schalten-Response",
-                            "status": "error",
-                            "message": "Serverfehler: Fehler beim Parsen der Skript-Antwort auf dem Server.",
-                            "details": str(e)
-                        }
-
-                else:
-                    response_to_client = {
-                        "action": "Schalten-Response",
-                        "status": "error",
-                        "message": "Fehler beim Ausführen des Schalten-Befehls.",
-                        "details": stderr.decode('utf-8')
-                    }
-
-                # Sende die Fehlermeldung nur an den Client, der sie angefordert hat, wenn ein Fehler aufgetreten ist
-                if response_to_client:
-                    await self.websocket.send(json.dumps(response_to_client))
+                dose = data.get("dose")
+                status = data.get("status")
+                await self.schalte_dose(websocket, dose, status)
 
         except json.JSONDecodeError:
-            self.log.error("Ungültiges JSON von Client empfangen.")
-            await self.websocket.send(json.dumps({"status": "error", "message": "Ungültiges JSON-Format."}))
-        except KeyError as e:
-            self.log.error(f"Fehlende Schlüssel in JSON-Nachricht: {e}")
-            await self.websocket.send(json.dumps({"status": "error", "message": f"Fehlende Daten im JSON: {e}"}))
+            self.log.error("Ungültiges JSON empfangen")
         except Exception as e:
-            self.log.error(f"Ein unerwarteter Fehler ist bei der Nachrichtenverarbeitung aufgetreten: {e}", exc_info=True)
-            await self.websocket.send(json.dumps({"status": "error", "message": f"Serverfehler: {e}"}))
+            self.log.error(f"Fehler bei handle_message: {str(e)}")
+
+    async def schalte_dose(self, websocket, dose_name, status):
+        self.log.info(f"Führe Schalten aus: {dose_name} -> {status}")
+
+        # Aufruf des externen Python-Skripts
+        process = await asyncio.create_subprocess_exec(
+            'python3', 'Schalten.py', '-d', str(dose_name), '-s', str(status),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode == 0:
+            response_str = stdout.decode('utf-8').strip()
+            try:
+                # Wir suchen den Start des JSON-Arrays, das Schalten.py liefert
+                start_idx = response_str.find('[')
+                if start_idx != -1:
+                    json_data = json.loads(response_str[start_idx:])
+                    if isinstance(json_data, list) and len(json_data) > 0:
+                        # Die aktualisierte Dose (inkl. SVGs) extrahieren
+                        updated_dose = json_data[0]
+                        
+                        # BROADCAST: Schicke die neuen Daten an ALLE Clients
+                        # Damit ändern sich die Icons synchron auf allen Handys/PCs
+                        await self.server.broadcast({
+                            "action": "update",
+                            "data": updated_dose
+                        })
+                        self.log.info(f"Broadcast für {dose_name} gesendet.")
+                else:
+                    self.log.error("Kein JSON im Output von Schalten.py gefunden.")
+            except Exception as e:
+                self.log.error(f"Fehler beim Parsen der Schalten-Antwort: {str(e)}")
+        else:
+            err = stderr.decode('utf-8')
+            self.log.error(f"Schalten.py Fehler: {err}")
+            await websocket.send(json.dumps({"action": "error", "message": err}))
+
+    async def send_all_steckdosen(self, websocket):
+        """Sendet die komplette Liste beim ersten Verbinden."""
+        process = await asyncio.create_subprocess_exec(
+            'python3', 'Schalten.py', '-A', 'spalte',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        response_str = stdout.decode('utf-8').strip()
+        
+        start_idx = response_str.find('[')
+        if start_idx != -1:
+            all_data = json.loads(response_str[start_idx:])
+            await websocket.send(json.dumps({
+                "action": "list",
+                "data": all_data
+            }))
 # --- ENDE DER NEUEN KLASSE ---
 
 async def register(websocket, path = "/"):

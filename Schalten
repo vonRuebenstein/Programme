@@ -182,20 +182,46 @@ def _format_val(k, v):
     return str(v) if v is not None else ""
 
 def show_table(data: List[Dict[str, Any]], orientation: str = "spalte"):
-    if not data: return
+    """
+    Stellt die Steckdosen-Daten in einer schicken Rich-Tabelle dar.
+    SVG-Spalten werden für die Terminal-Übersicht ausgeblendet.
+    """
+    if not data:
+        console.print("[yellow]Keine Daten zum Anzeigen vorhanden.[/yellow]")
+        return
+
     table = Table(header_style="bold magenta", box=None)
-    keys = list(data[0].keys())
+    
+    # Wir filtern die SVG-Daten raus, damit die Tabelle im Terminal nicht gesprengt wird
+    alle_keys = list(data[0].keys())
+    keys = [k for k in alle_keys if k not in ["svg_on", "svg_off"]]
+
     if orientation.lower() == "spalte":
-        for key in keys: table.add_column(key)
-        for row in data: table.add_row(*[_format_val(k, row[k]) for k in keys])
-    else:
-        table.add_column("Merkmal", style="bold cyan")
-        for row in data: table.add_column(str(row.get("Bezeichnung", "Dose")))
+        # Klassische Ansicht: Spalten = Merkmale
         for key in keys:
-            if key == "Bezeichnung": continue
+            table.add_column(key)
+        
+        for row in data:
+            # Wir übergeben nur die Werte der gefilterten Keys
+            table.add_row(*[_format_val(k, row[k]) for k in keys])
+            
+    else:
+        # Alternative Ansicht (Zeile): Merkmale stehen links untereinander
+        table.add_column("Merkmal", style="bold cyan")
+        
+        # Jede Dose bekommt eine eigene Spalte
+        for row in data:
+            table.add_column(str(row.get("Bezeichnung", "Dose")))
+            
+        # Wir gehen die gefilterten Merkmale durch
+        for key in keys:
+            if key == "Bezeichnung":
+                continue
             row_cells = [key]
-            for item in data: row_cells.append(_format_val(key, item.get(key)))
+            for item in data:
+                row_cells.append(_format_val(key, item.get(key)))
             table.add_row(*row_cells)
+
     console.print(table)
 
 async def main():
@@ -213,24 +239,36 @@ async def main():
 
     with DatabaseManager(cfg) as db:
         if args.all or (args.anzeigen and not args.dose):
+            # Holt alle Dosen inkl. der neuen SVG-Felder
             data = db.execute("SELECT * FROM Bungalow.FSteckdosen WHERE Bezeichnung IS NOT NULL ORDER BY Fernbedienung, Kanal")
             if sys.stdout.isatty():
+                # In der Konsolen-Ansicht filtern wir die SVGs später in show_table raus
                 show_table(data, args.all or "spalte")
             else:
+                # Roh-Daten (inkl. SVGs) für den WebSocket-Server
                 print(json.dumps(data, default=json_serializer))
         
         elif args.dose:
             dose = Dose(db, cfg, args.dose)
             if dose.params:
                 success = await dose.schalten_async(int(args.status), 3)
+                
+                # WICHTIG: Wir laden die Daten NACH dem Schalten neu, 
+                # damit Status, Zeitstempel UND SVGs aktuell sind.
+                aktuelle_daten = dose._load(args.dose)
+                
                 if not sys.stdout.isatty():
-                    # WICHTIG: Das Ergebnis in ein ARRAY [] packen, damit PHP zufrieden ist
-                    print(json.dumps([dose._load(args.dose)], default=json_serializer))
+                    # Das Ergebnis als Array für die WebSocket/PHP Kompatibilität
+                    print(json.dumps([aktuelle_daten], default=json_serializer))
                 elif success:
+                    # Schöne Terminal-Ausgabe bleibt erhalten
                     color = "green" if args.status == "1" else "red"
                     label = "ON" if args.status == "1" else "OFF"
                     console.print(f"[bold green]✔[/bold green] {dose.params['Bezeichnung']} ist jetzt [bold {color}]{label}[/bold {color}]")
             else:
+                # Falls die Dose nicht in der DB gefunden wurde
+                if not sys.stdout.isatty():
+                    print(json.dumps({"status": "error", "message": "Dose nicht gefunden"}))
                 sys.exit(1)
 
 if __name__ == "__main__":
