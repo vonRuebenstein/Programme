@@ -1,5 +1,21 @@
 "use strict";
 
+function toggleMobileMenu() {
+    // Nur auf Handys/Tablets (Breite < 768px) soll das Klicken etwas tun
+    if (window.innerWidth < 768) {
+        const menu = document.getElementById('flying-menu-content');
+        const pfeil = document.getElementById('pfeil');
+        
+        if (menu.classList.contains('hidden')) {
+            menu.classList.remove('hidden');
+            pfeil.style.transform = 'rotate(180deg)';
+        } else {
+            menu.classList.add('hidden');
+            pfeil.style.transform = 'rotate(0deg)';
+        }
+    }
+}
+
 (function() {
     // --- Konfiguration ---
     let socket = null;

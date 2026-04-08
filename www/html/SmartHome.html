@@ -57,7 +57,7 @@
                 <a class="btn btn-ghost">Home</a>
             </div>
         </nav>
-        <h1 class="text-4xl font-bold text-center mt-8">Funksteckdosen</h1>
+        <h1 class="text-4xl font-bold text-center mt-8">SmartHome Steuerung</h1>
     </header>
 
     <main class="container mx-auto px-4 mt-8">
@@ -65,20 +65,21 @@
     </main>
     <div id="benachrichtigungsContainer" class="toast toast-end z-[100]"></div>
 
-    <div class="fixed bottom-4 left-4 z-50 w-72">
-        <div class="collapse collapse-arrow bg-base-100 shadow-2xl border border-primary/20 collapse-open">
-            <input type="checkbox" checked /> 
-            <div class="collapse-title text-xs font-bold flex items-center gap-2 bg-base-300">
+    <div class="fixed bottom-0 left-0 w-full md:bottom-4 md:left-4 md:w-96 z-50 p-2 md:p-0">
+        <div class="bg-base-300 shadow-2xl border border-primary/20 rounded-t-xl md:rounded-xl overflow-hidden">
+            
+            <div onclick="toggleMobileMenu()" class="text-xs font-bold flex items-center gap-2 bg-base-300 px-4 py-3 cursor-pointer">
                 <span class="relative flex h-2 w-2">
                     <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75"></span>
                     <span class="relative inline-flex rounded-full h-2 w-2 bg-success"></span>
                 </span>
                 SYSTEM STATUS
+                <span id="pfeil" class="ml-auto md:hidden transition-transform">▼</span>
             </div>
-            <div class="collapse-content bg-base-100 p-0"> 
-                <div id="flying-menu-content" class="h-48 min-h-[150px] overflow-y-auto p-2 space-y-1 font-mono text-[10px] leading-tight">
-                    <div class="text-info opacity-50 italic">Initialisiere Protokoll...</div>
-                </div>
+    
+            <div id="flying-menu-content" 
+                 class="hidden md:block h-32 md:h-64 overflow-y-auto p-2 space-y-1 font-mono text-[10px] bg-base-100 border-t border-base-300">
+                <div class="text-info opacity-50 italic">System bereit...</div>
             </div>
         </div>
     </div>
