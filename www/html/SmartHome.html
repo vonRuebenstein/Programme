@@ -65,6 +65,24 @@
     </main>
     <div id="benachrichtigungsContainer" class="toast toast-end z-[100]"></div>
 
+    <div class="fixed bottom-4 left-4 z-50 w-72">
+        <div class="collapse collapse-arrow bg-base-100 shadow-2xl border border-primary/20 collapse-open">
+            <input type="checkbox" checked /> 
+            <div class="collapse-title text-xs font-bold flex items-center gap-2 bg-base-300">
+                <span class="relative flex h-2 w-2">
+                    <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75"></span>
+                    <span class="relative inline-flex rounded-full h-2 w-2 bg-success"></span>
+                </span>
+                SYSTEM STATUS
+            </div>
+            <div class="collapse-content bg-base-100 p-0"> 
+                <div id="flying-menu-content" class="h-48 min-h-[150px] overflow-y-auto p-2 space-y-1 font-mono text-[10px] leading-tight">
+                    <div class="text-info opacity-50 italic">Initialisiere Protokoll...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="scripts/js/Smarthome.js"></script>
 </body>
 </html>

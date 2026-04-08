@@ -19,6 +19,7 @@ from rich.text import Text
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, SpinnerColumn
 
 import paho.mqtt.client as mqtt
+import socket
 
 # --- Konfiguration ---
 CREDENTIALS_FILE = Path("/home/pi/.credentials.toml")
@@ -71,6 +72,49 @@ class Dose:
         self.db = db
         self.config = config
         self.params = self._load(identifier) if identifier else None
+
+    # Ganz oben bei den Imports sicherstellen:
+import socket
+
+# ... (deine DatabaseManager Klasse) ...
+
+class Dose:
+    def __init__(self, db: DatabaseManager, config: dict, identifier: str = None):
+        self.db = db
+        self.config = config # Hier stecken jetzt die TOML-Werte drin
+        self.params = self._load(identifier) if identifier else None
+
+    def _notify_sync(self):
+        """Sendet das Refresh-Signal an den WebSocket-Server."""
+        try:
+            # Wir lesen die Werte direkt aus der config (aus der TOML)
+            host = self.config.get("send_mesage_host", "127.0.0.1")
+            port = int(self.config.get("send_message_port", 5006))
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Wir senden "refresh", damit der Server es als Nachricht erkennt
+            sock.sendto(b"refresh", (host, port))
+            sock.close()
+        except Exception as e:
+            # Optional: logging.error(f"Sync-Fehler: {e}")
+            pass
+
+    async def schalten_async(self, status: int, versuche: int) -> bool:
+        # ... (deine Progress-Bar und Schalt-Logik bleibt exakt gleich) ...
+        
+        # Am Ende der Methode, wenn geschaltet wurde:
+        if success:
+            self._update_db(status)
+            
+            # Hier rufen wir die neue Funktion auf:
+            self.notify_sync()
+            
+            if sys.stdout.isatty():
+                color = "green" if status == 1 else "red"
+                status_label = "ON" if status == 1 else "OFF"
+                console.print(f"[bold green]✔[/bold green] [white]{self.params['Bezeichnung']}[/white] ist jetzt [bold {color}]{status_label}[/bold {color}]")
+        
+        return success
 
     def _load(self, identifier: str) -> Optional[dict]:
         # SELECT * stellt sicher, dass alle Felder (ID, Bemerkung etc.) dabei sind
@@ -129,6 +173,8 @@ class Dose:
         # Nach der Bar die finale Text-Bestätigung (nur im interaktiven Terminal)
         if success:
             self._update_db(status)
+            # Hier rufen wir die neue Funktion auf:
+            self._notify_sync()
             if sys.stdout.isatty():
                 color = "green" if status == 1 else "red"
                 console.print(f"[bold green]✔[/bold green] [white]{self.params['Bezeichnung']}[/white] ist jetzt [bold {color}]{status_label}[/bold {color}]")
