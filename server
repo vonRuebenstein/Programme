@@ -6,7 +6,7 @@ import argparse
 import toml
 import aiomysql
 import re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +32,6 @@ app.add_middleware(
 # --- CONNECTION MANAGER (Abo-Modell) ---
 class ConnectionManager:
     def __init__(self):
-        # Speichert {WebSocket: set([port1, port2])}
         self.active_connections: dict[WebSocket, set] = {}
 
     async def connect(self, websocket: WebSocket):
@@ -47,7 +46,6 @@ class ConnectionManager:
 
     async def update_subscription(self, websocket: WebSocket, ports: list):
         if websocket in self.active_connections:
-            # Ports in Integer wandeln zur Sicherheit
             self.active_connections[websocket] = set(int(p) for p in ports)
             logger.info(f"WS-CLIENT  | Abo aktualisiert: {list(self.active_connections[websocket])}")
 
@@ -61,37 +59,85 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# --- UNIVERSAL DB STREAMER (Für Temperatur & Zähler) ---
-async def stream_from_db(websocket, bungalow, start, end, db_cfg, procedure, action_label):
-    logger.info(f"DB-STREAM  | {action_label} für {bungalow} via {procedure}")
+async def stream_temperatures_to_websocket(websocket, bungalow, start, end):
+    """
+    Holt Daten aus der SP und pumpt sie als JSON-konforme Chunks zum Client.
+    Nutzt Duck-Typing, um Import-Konflikte (datetime/timedelta) zu umgehen.
+    """
+    db_cfg = app.state.db_temp 
+    conn = None
     try:
         conn = await aiomysql.connect(
-            host=db_cfg['db_host'], user=db_cfg['db_user'],
-            password=db_cfg['db_pwd'], db=db_cfg['db_name']
+            host=db_cfg['db_host'], 
+            user=db_cfg['db_user'],
+            password=db_cfg['db_pwd'], 
+            db=db_cfg['db_name']
         )
+        
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.callproc(procedure, (bungalow, start, end, 0, 100000))
-            rows = await cur.fetchall()
+            logging.info(f"DB-FETCH   | SP-Aufruf für {bungalow}: {start} bis {end}")
             
-            chunk_size = 2000
-            for i in range(0, len(rows), chunk_size):
-                chunk = rows[i:i + chunk_size]
-                for row in chunk:
-                    for k, v in row.items():
-                        if isinstance(v, (datetime, date)): row[k] = v.isoformat()
-                        elif isinstance(v, Decimal): row[k] = float(v)
-                
-                await websocket.send_json({
-                    "action": f"{action_label}_chunk",
-                    "data": chunk,
-                    "last": (i + chunk_size >= len(rows))
-                })
-        conn.close()
-        logger.info(f"DB-STREAM  | {action_label} fertig.")
-    except Exception as e:
-        logger.error(f"DB-FEHLER  | {e}")
+            # Aufruf der Stored Procedure
+            await cur.callproc('Bungalow.proc_Temperatur_Master_1', (bungalow, start, end))
+            all_results = await cur.fetchall()
+            
+            total = len(all_results)
+            sent = 0
+            logging.info(f"DB-STREAM  | {total} Sätze gefunden. Starte Versand...")
 
-# --- UDP LISTENER (Input von Loggern) ---
+            while sent < total:
+                # Dynamische Chunk-Größe: Erst 1000, dann 5000
+                current_size = 1000 if sent < 3000 else 5000
+                batch = all_results[sent : sent + current_size]
+                
+                json_ready_chunk = []
+                for row in batch:
+                    clean_row = {}
+                    for key, value in row.items():
+                        # 1. Fall: Datum/Uhrzeit (hat isoformat-Methode)
+                        if hasattr(value, 'isoformat'):
+                            clean_row[key] = value.isoformat()
+                        
+                        # 2. Fall: Zeitspannen/Timedelta (hat total_seconds-Methode)
+                        elif hasattr(value, 'total_seconds'):
+                            clean_row[key] = str(value)
+                        
+                        # 3. Fall: MySQL Decimal (Zahlen mit Komma)
+                        elif isinstance(value, Decimal):
+                            clean_row[key] = float(value)
+                        
+                        # 4. Fall: Alles andere (Strings, Ints, Floats)
+                        else:
+                            clean_row[key] = value
+                    
+                    json_ready_chunk.append(clean_row)
+
+                # Paket über den WebSocket senden
+                await websocket.send_json({
+                    "action": "temp_data_chunk",
+                    "data": json_ready_chunk,
+                    "progress": round((sent + len(batch)) / total * 100, 1)
+                })
+                
+                sent += len(batch)
+                # Kurze Pause, damit der Server auch andere Anfragen bearbeiten kann
+                await asyncio.sleep(0.01)
+
+            # Abschluss-Signal für das Frontend (Spinner stoppen)
+            await websocket.send_json({"action": "temp_stream_finished"})
+            logging.info("DB-STREAM  | Übertragung erfolgreich beendet.")
+
+    except Exception as e:
+        logging.error(f"STREAM-ERR | Fehler beim Streaming: {e}")
+        try:
+            await websocket.send_json({"action": "temp_stream_finished"})
+        except:
+            pass
+    finally:
+        if conn:
+            conn.close()
+
+# --- UDP LISTENER ---
 class SmartHomeUDP(asyncio.DatagramProtocol):
     def __init__(self, port):
         self.port = port
@@ -101,12 +147,8 @@ class SmartHomeUDP(asyncio.DatagramProtocol):
             raw_msg = data.decode("utf-8", "ignore").strip()
             now = datetime.now()
             sender_ip, sender_port = addr
-            
-            # --- NEU: Konsolen-Ausgabe ---
-            # So siehst du sofort, was auf welchem Port reinkommt
             logging.info(f"UDP-IN [Port {self.port}] von {sender_ip}: {raw_msg}")
 
-            # Log-Eintrag erkennen
             log_match = re.search(r'\[(INFO|WARN|ERROR|DEBUG)\]', raw_msg)
             if log_match:
                 msg_type, log_level = "log", log_match.group(1)
@@ -115,7 +157,6 @@ class SmartHomeUDP(asyncio.DatagramProtocol):
                 msg_type, log_level = "pulse", None
                 clean_msg = raw_msg
 
-            # Payload für das Frontend
             payload = {
                 "type": msg_type,
                 "received_on_port": int(self.port),
@@ -126,10 +167,7 @@ class SmartHomeUDP(asyncio.DatagramProtocol):
                 "message": clean_msg,
                 "level": log_level
             }
-            
-            # Weiterleiten an WebSocket-Abonnenten
             asyncio.create_task(manager.broadcast_to_subscribers(int(self.port), payload))
-            
         except Exception as e:
             logging.error(f"UDP-PARSER-FEHLER | {e}")
 
@@ -138,8 +176,6 @@ class SmartHomeUDP(asyncio.DatagramProtocol):
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    
-    # Pfad zum Skript (einmal zentral definiert)
     schalten_script = "/home/pi/Schalten"
     
     try:
@@ -147,34 +183,23 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             action = data.get("action")
             
-            # --- 1. INITIALISIERUNG: Nutzt "Schalten -A zeile" ohne Dosenname ---
             if action == "request_all_doses":
-                logging.info("WS-CLIENT  | Initialisierung via Schalten -a")
                 try:
-                    # Aufruf ohne Dose, nur mit -a liefert alle Dosen als JSON
                     process = await asyncio.create_subprocess_exec(
                         schalten_script, "-a",
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
                     )
                     stdout, _ = await process.communicate()
-                    
                     if process.returncode == 0 and stdout:
                         all_doses = json.loads(stdout.decode())
-                        await websocket.send_json({
-                            "action": "getData-response",
-                            "data": all_doses
-                        })
+                        await websocket.send_json({"action": "getData-response", "data": all_doses})
                 except Exception as e:
                     logging.error(f"INIT-ERROR | {e}")
 
-            # --- 2. SCHALTEN: Nutzt "Schalten [Dose] [Status] -a" ---
             elif action == "Schalten":
                 bezeichnung = data.get("bezeichnung")
                 status = "1" if str(data.get("status")) == "1" else "0"
-                
-                logging.info(f"AKTION     | Schalte {bezeichnung} -> {status}")
-                
                 try:
                     process = await asyncio.create_subprocess_exec(
                         schalten_script, bezeichnung, status, "-a",
@@ -182,22 +207,22 @@ async def websocket_endpoint(websocket: WebSocket):
                         stderr=asyncio.subprocess.PIPE
                     )
                     stdout, stderr = await process.communicate()
-                    
                     if process.returncode == 0 and stdout:
                         updated_info = json.loads(stdout.decode())
-                        # Skript gibt [ {dose} ] zurück -> wir senden das erste Element
                         if isinstance(updated_info, list) and len(updated_info) > 0:
                             await websocket.send_json(updated_info[0])
-                    else:
-                        logging.error(f"SCHALT-ERR | {stderr.decode()}")
                 except Exception as e:
                     logging.error(f"PROC-ERROR | {e}")
 
-            # --- 3. ABO-SYSTEM ---
             elif action == "subscribe":
                 ports = [int(p) for p in data.get("ports", []) if str(p).isdigit()]
                 await manager.update_subscription(websocket, ports)
-                logging.info(f"WS-CLIENT  | Abo: {ports}")
+
+            elif action == "request_temp_history":
+                bungalow = data.get("bungalow", "B5")
+                start = data.get("start")
+                end = data.get("end")
+                asyncio.create_task(stream_temperatures_to_websocket(websocket, bungalow, start, end))
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -207,97 +232,44 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # --- STARTUP ---
 async def main():
-    # In der main() Funktion:
-    config = toml.load('/home/pi/.credentials.toml')
-
-# Speichere die Sektionen separat im Status der App
-    app.state.db_temp = config['temperatur']       # Für Temperaturen
-    app.state.db_zaehlen = config['zaehlen']       # Für Impulse
-    """Hauptfunktion des Servers, die Argumente parst und Listener startet."""
-    
-    parser = argparse.ArgumentParser(
-        description="FastAPI SmartHome Server - Asynchrone Version",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    
-    # --- 1:1 Übernahme deiner alten Argumente ---
-    parser.add_argument(
-        '--udp-ip',
-        type=str, # Hier kannst du deine ip_address_type Funktion einsetzen
-        default='0.0.0.0',
-        help="IP-Adresse oder Hostname für den UDP-Listener."
-    )
-    parser.add_argument(
-        '--websocket-ip',
-        type=str,
-        default='0.0.0.0',
-        help="IP-Adresse oder Hostname für den WebSocket-Server."
-    )
-    parser.add_argument(
-        '-u', '--udp-ports',
-        type=str,
-        nargs='+',
-        default=["5005", "5006", "5007"],
-        help="Liste von UDP-Ports."
-    )
-    parser.add_argument(
-        '-w', '--websocket-port',
-        type=int, # Entspricht deinem port_type
-        default=None,
-        help="Port für den WebSocket-Server. Falls None, startet kein WS."
-    )
-    parser.add_argument(
-        '-q', '--quiet',
-        action='store_true',
-        help="Schaltet INFO-Meldungen ab."
-    )
+    parser = argparse.ArgumentParser(description="FastAPI SmartHome Server")
+    parser.add_argument('--udp-ip', type=str, default='0.0.0.0')
+    parser.add_argument('--websocket-ip', type=str, default='0.0.0.0')
+    parser.add_argument('-u', '--udp-ports', type=str, nargs='+', default=["5005", "5006", "5007"])
+    parser.add_argument('-w', '--websocket-port', type=int, default=None)
+    parser.add_argument('-q', '--quiet', action='store_true')
 
     args = parser.parse_args()
-
-    # --- Loglevel wie gewohnt ---
     if args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
-    
-    # Ports konvertieren (wie dein alter port_list_type)
+
+    credentials_path = '/home/pi/.credentials.toml'
+    try:
+        config = toml.load(credentials_path)
+        app.state.db_temp = config.get('temperatur')
+        app.state.db_zaehler = config.get('zaehlen')
+        logging.info(f"CONFIG-LOAD | {credentials_path} erfolgreich geladen.")
+    except Exception as e:
+        logging.critical(f"CONFIG-ERROR| {e}")
+        return
+
     udp_ports_to_listen = [int(p) for p in args.udp_ports]
-
-    # --- Datenbank-Konfiguration laden ---
-    config = toml.load('/home/pi/.credentials.toml')
-    app.state.db_temp = config['temperatur']
-    app.state.db_zaehler = config.get('zaehler')
-
     loop = asyncio.get_running_loop()
 
-    # --- UDP Listener starten ---
     for p in udp_ports_to_listen:
-        # Hier nutzen wir args.udp_ip
         await loop.create_datagram_endpoint(
             lambda p=p: SmartHomeUDP(p), 
             local_addr=(args.udp_ip, p)
         )
-        logging.info(f"UDP-READY  | Port {p} aktiv auf {args.udp_ip}")
+        logging.info(f"UDP-READY   | Port {p} aktiv.")
 
-    # --- WebSocket Server starten (nur wenn -w angegeben wurde) ---
     if args.websocket_port is not None:
-        logging.info(f"WS-READY   | Starte FastAPI/Uvicorn auf {args.websocket_ip}:{args.websocket_port}")
-        
-        # Uvicorn Konfiguration nutzt explizit die websocket-ip
-        config = Config(
-            app=app, 
-            host=args.websocket_ip, 
-            port=args.websocket_port, 
-            log_level="warning" if args.quiet else "info"
-        )
-        server = Server(config)
+        config_uv = Config(app=app, host=args.websocket_ip, port=args.websocket_port, log_level="info")
+        server = Server(config_uv)
         await server.serve()
-    else:
-        logging.warning("WS-SKIP    | Kein WebSocket-Port angegeben (-w). Server läuft nur als UDP-Logger.")
-        # Wenn kein WS läuft, müssen wir den Loop am Leben erhalten
-        while True:
-            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("SYSTEM     | Server manuell gestoppt.")
+        pass
