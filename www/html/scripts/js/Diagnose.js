@@ -11,7 +11,7 @@ const connectionStatusSpan = document.getElementById('connectionStatus');
 const messagesDiv = document.getElementById('messages');
 
 // WebSocket-URL Konfiguration
-const websocketUrl = 'ws://pipbh.b5.intern:8765';
+const websocketUrl = 'ws://pipbh.b5.intern:8765/ws';
 
 let ws; 
 let reconnectInterval = null;
@@ -23,7 +23,7 @@ const reconnectSettings = {
 };
 let reconnectAttempts = 0;
 
-const subscribedPorts = [5005, 5006, 5007]; // The ports to be subscribed to on this page
+const subscribedPorts = [5005]; // The ports to be subscribed to on this page
     
 // Mapping of ports to DaisyUI colors
 const portColors = {

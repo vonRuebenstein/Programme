@@ -138,33 +138,81 @@ class SmartHomeUDP(asyncio.DatagramProtocol):
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    
+    # Pfad zum Skript (einmal zentral definiert)
+    schalten_script = "/home/pi/Schalten"
+    
     try:
         while True:
             data = await websocket.receive_json()
             action = data.get("action")
             
-            if action == "subscribe":
-                await manager.update_subscription(websocket, data.get("ports", []))
-            
-            elif action == "get_history": # Temperatur
-                await stream_from_db(websocket, data['bungalow'], data['start'], data['end'], 
-                                   app.state.db_temp, 'Bungalow.proc_Temperatur_Master', 'temp')
-            
-            elif action == "get_zaehler": # Zähler
-                await stream_from_db(websocket, data['bungalow'], data['start'], data['end'], 
-                                   app.state.db_zaehler, 'Bungalow.proc_Zaehler_Master', 'zaehler')
-            
-            elif action == "unsubscribe":
-                await manager.update_subscription(websocket, [])
+            # --- 1. INITIALISIERUNG: Nutzt "Schalten -A zeile" ohne Dosenname ---
+            if action == "request_all_doses":
+                logging.info("WS-CLIENT  | Initialisierung via Schalten -a")
+                try:
+                    # Aufruf ohne Dose, nur mit -a liefert alle Dosen als JSON
+                    process = await asyncio.create_subprocess_exec(
+                        schalten_script, "-a",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await process.communicate()
+                    
+                    if process.returncode == 0 and stdout:
+                        all_doses = json.loads(stdout.decode())
+                        await websocket.send_json({
+                            "action": "getData-response",
+                            "data": all_doses
+                        })
+                except Exception as e:
+                    logging.error(f"INIT-ERROR | {e}")
+
+            # --- 2. SCHALTEN: Nutzt "Schalten [Dose] [Status] -a" ---
+            elif action == "Schalten":
+                bezeichnung = data.get("bezeichnung")
+                status = "1" if str(data.get("status")) == "1" else "0"
+                
+                logging.info(f"AKTION     | Schalte {bezeichnung} -> {status}")
+                
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        schalten_script, bezeichnung, status, "-a",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode == 0 and stdout:
+                        updated_info = json.loads(stdout.decode())
+                        # Skript gibt [ {dose} ] zurück -> wir senden das erste Element
+                        if isinstance(updated_info, list) and len(updated_info) > 0:
+                            await websocket.send_json(updated_info[0])
+                    else:
+                        logging.error(f"SCHALT-ERR | {stderr.decode()}")
+                except Exception as e:
+                    logging.error(f"PROC-ERROR | {e}")
+
+            # --- 3. ABO-SYSTEM ---
+            elif action == "subscribe":
+                ports = [int(p) for p in data.get("ports", []) if str(p).isdigit()]
+                await manager.update_subscription(websocket, ports)
+                logging.info(f"WS-CLIENT  | Abo: {ports}")
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception as e:
-        logger.error(f"WS-LOOP-FEHLER | {e}")
+        logging.error(f"WS-GLOBAL-ERROR | {e}")
         manager.disconnect(websocket)
 
 # --- STARTUP ---
 async def main():
+    # In der main() Funktion:
+    config = toml.load('/home/pi/.credentials.toml')
+
+# Speichere die Sektionen separat im Status der App
+    app.state.db_temp = config['temperatur']       # Für Temperaturen
+    app.state.db_zaehlen = config['zaehlen']       # Für Impulse
     """Hauptfunktion des Servers, die Argumente parst und Listener startet."""
     
     parser = argparse.ArgumentParser(
