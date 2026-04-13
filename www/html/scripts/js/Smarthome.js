@@ -1,7 +1,7 @@
 'use strict';
 
 // Konfigurationsvariablen für die WebSocket-Verbindung
-const WEBSOCKET_HOST = 'ws://pipbh.b5.intern:8765';
+const WEBSOCKET_HOST = 'ws://pipbh.b5.intern:8765/ws';
 let websocket;
 
 // Funktion zum Anzeigen von Benachrichtigungen (angepasst für DaisyUI toast)
