@@ -218,6 +218,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 ports = [int(p) for p in data.get("ports", []) if str(p).isdigit()]
                 await manager.update_subscription(websocket, ports)
 
+            elif action == "unsubscribe":
+                await manager.update_subscription(websocket, [])
+                # Oder falls Methode oben ergänzt: await manager.unsubscribe(websocket)
+
             elif action == "request_temp_history":
                 bungalow = data.get("bungalow", "B5")
                 start = data.get("start")
