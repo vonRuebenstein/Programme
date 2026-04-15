@@ -16,7 +16,7 @@ function initWebSocket() {
     socket = new WebSocket(wsUri);
 
     socket.onopen = () => {
-        console.log("WS-Verbunden: Bereit zum Gasgeben!");
+        console.log("mit websocket verbunden");
     };
 
     socket.onmessage = (event) => {
